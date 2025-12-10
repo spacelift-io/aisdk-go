@@ -6,6 +6,7 @@ import (
 	"io"
 	"iter"
 	"net/http"
+	"strings"
 )
 
 // Chat is the structure sent from `useChat` to the server.
@@ -18,126 +19,16 @@ type Chat struct {
 // DataStream is a stream of DataStreamParts.
 type DataStream iter.Seq2[DataStreamPart, error]
 
-// WithToolCalling passes tool calls to the handleToolCall function.
-func (s DataStream) WithToolCalling(handleToolCall func(toolCall ToolCall) any) DataStream {
-	return func(yield func(DataStreamPart, error) bool) {
-		// Track partial tool calls by ID
-		partialToolCalls := make(map[string]struct {
-			text     string
-			step     int
-			toolName string
-		})
-
-		// Track current step
-		step := 0
-
-		// Process a complete tool call
-		processToolCall := func(id string, name string, args map[string]any) bool {
-			if !yield(ToolCallStreamPart{
-				ToolCallID: id,
-				ToolName:   name,
-				Args:       args,
-			}, nil) {
-				return false
-			}
-
-			// Call the handler and get the result
-			result := handleToolCall(ToolCall{
-				ID:   id,
-				Name: name,
-				Args: args,
-			})
-
-			// Yield the result
-			return yield(ToolResultStreamPart{
-				ToolCallID: id,
-				Result:     result,
-			}, nil)
-		}
-
-		// Process a tool call delta
-		processDelta := func(id string, delta string) bool {
-			partialCall := partialToolCalls[id]
-			partialCall.text += delta
-			partialToolCalls[id] = partialCall
-
-			// Try to parse the partial JSON
-			var args map[string]any
-			if err := json.Unmarshal([]byte(partialCall.text), &args); err == nil {
-				// Successfully parsed complete args, process the call
-				if !processToolCall(id, partialCall.toolName, args) {
-					return false
-				}
-				delete(partialToolCalls, id)
-			}
-
-			return true
-		}
-
-		for part, err := range s {
-			if err != nil {
-				yield(nil, err)
-				return
-			}
-
-			if !yield(part, nil) {
-				return
-			}
-
-			switch p := part.(type) {
-			case StartStepStreamPart:
-				// Keep track of step for tool calls
-				step++
-
-			case ToolCallStartStreamPart:
-				// Initialize a new partial tool call
-				partialToolCalls[p.ToolCallID] = struct {
-					text     string
-					step     int
-					toolName string
-				}{
-					text:     "",
-					step:     step,
-					toolName: p.ToolName,
-				}
-
-			case ToolCallDeltaStreamPart:
-				if !processDelta(p.ToolCallID, p.ArgsTextDelta) {
-					return
-				}
-
-			case ToolCallStreamPart:
-				if !processToolCall(p.ToolCallID, p.ToolName, p.Args) {
-					return
-				}
-				delete(partialToolCalls, p.ToolCallID)
-
-			case FinishStepStreamPart:
-				// Clean up any remaining partial tool calls
-				for id := range partialToolCalls {
-					delete(partialToolCalls, id)
-				}
-			}
-		}
+func SendSingleDataStreamPart(w io.Writer, part DataStreamPart) error {
+	messageJson, err := formatJSONPart(part)
+	if err != nil {
+		return fmt.Errorf("failed to format part: %w", err)
 	}
-}
-
-// WithAccumulator passes parts to the accumulator which aggregates them into a single message.
-func (s DataStream) WithAccumulator(accumulator *DataStreamAccumulator) DataStream {
-	return func(yield func(DataStreamPart, error) bool) {
-		for part, err := range s {
-			if err != nil {
-				yield(nil, err)
-				return
-			}
-			err = accumulator.Push(part)
-			if err != nil {
-				yield(nil, err)
-				return
-			}
-			yield(part, nil)
-		}
+	_, err = fmt.Fprint(w, fmt.Sprintf("data: %s\n\n", messageJson))
+	if err != nil {
+		return fmt.Errorf("failed to write part to writer: %w", err)
 	}
+	return nil
 }
 
 // Pipe iterates over the DataStream and writes the parts to the writer.
@@ -150,15 +41,29 @@ func (s DataStream) Pipe(w io.Writer) error {
 	var pipeErr error
 	s(func(part DataStreamPart, err error) bool {
 		if err != nil {
+			errorPart := ErrorPart{ErrorText: err.Error()}
+			if messageJson, formatErr := formatJSONPart(errorPart); formatErr == nil {
+				fmt.Fprint(w, fmt.Sprintf("data: %s\n\n", messageJson))
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
 			pipeErr = err
 			return false
 		}
-		formatted, err := part.Format()
+		messageJson, err := formatJSONPart(part)
 		if err != nil {
+			errorPart := ErrorPart{ErrorText: fmt.Sprintf("failed to format part: %s", err.Error())}
+			if errorJson, formatErr := formatJSONPart(errorPart); formatErr == nil {
+				fmt.Fprint(w, fmt.Sprintf("data: %s\n\n", errorJson))
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
 			pipeErr = err
 			return false
 		}
-		_, err = fmt.Fprint(w, formatted)
+		_, err = fmt.Fprint(w, fmt.Sprintf("data: %s\n\n", messageJson))
 		if err != nil {
 			pipeErr = err
 			return false
@@ -168,128 +73,117 @@ func (s DataStream) Pipe(w io.Writer) error {
 		}
 		return true
 	})
+
+	// Send the "[DONE]" termination sequence for v2 protocol
+	if pipeErr == nil {
+		_, err := fmt.Fprint(w, "[DONE]\n\n")
+		if err != nil {
+			pipeErr = err
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+
 	return pipeErr
 }
 
 // DataStreamPart represents a part of the Vercel AI SDK data stream.
 type DataStreamPart interface {
-	Format() (string, error)
-	TypeID() byte
+	Type() string
 }
 
-// TextStreamPart corresponds to TYPE_ID '0'.
-type TextStreamPart struct {
-	Content string
+// MessageStartPart indicates the start of a new message.
+type MessageStartPart struct {
+	MessageID string `json:"messageId,omitempty"`
 }
 
-func (p TextStreamPart) TypeID() byte { return '0' }
-func (p TextStreamPart) Format() (string, error) {
-	jsonContent, err := json.Marshal(p.Content)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal text content: %w", err)
-	}
-	return fmt.Sprintf("%c:%s\n", p.TypeID(), string(jsonContent)), nil
+func (p MessageStartPart) Type() string { return "start" }
+
+// TextStartPart indicates the start of a text segment.
+type TextStartPart struct {
+	ID string `json:"id"`
 }
 
-// ReasoningStreamPart corresponds to TYPE_ID 'g'.
-type ReasoningStreamPart struct {
-	Content string
+func (p TextStartPart) Type() string { return "text-start" }
+
+// TextDeltaPart contains incremental text content.
+type TextDeltaPart struct {
+	ID    string `json:"id"`
+	Delta string `json:"delta"`
 }
 
-func (p ReasoningStreamPart) TypeID() byte { return 'g' }
-func (p ReasoningStreamPart) Format() (string, error) {
-	jsonContent, err := json.Marshal(p.Content)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal reasoning content: %w", err)
-	}
-	return fmt.Sprintf("%c:%s\n", p.TypeID(), string(jsonContent)), nil
+func (p TextDeltaPart) Type() string { return "text-delta" }
+
+// TextEndPart indicates the end of a text segment.
+type TextEndPart struct {
+	ID string `json:"id"`
 }
 
-// RedactedReasoningStreamPart corresponds to TYPE_ID 'i'.
-type RedactedReasoningStreamPart struct {
-	Data string `json:"data"`
+func (p TextEndPart) Type() string { return "text-end" }
+
+// ReasoningStartPart indicates the start of a reasoning segment.
+type ReasoningStartPart struct {
+	ID string `json:"id"`
 }
 
-func (p RedactedReasoningStreamPart) TypeID() byte { return 'i' }
-func (p RedactedReasoningStreamPart) Format() (string, error) {
-	return formatJSONPart(p)
+func (p ReasoningStartPart) Type() string { return "reasoning-start" }
+
+// ReasoningDeltaPart contains incremental reasoning content.
+type ReasoningDeltaPart struct {
+	ID               string           `json:"id"`
+	Delta            string           `json:"delta"`
+	ProviderMetadata ProviderMetadata `json:"providerMetadata,omitzero"`
 }
 
-// ReasoningSignatureStreamPart corresponds to TYPE_ID 'j'.
-type ReasoningSignatureStreamPart struct {
-	Signature string `json:"signature"`
+func (p ReasoningDeltaPart) Type() string { return "reasoning-delta" }
+
+// ReasoningEndPart indicates the end of a reasoning segment.
+type ReasoningEndPart struct {
+	ID string `json:"id"`
 }
 
-func (p ReasoningSignatureStreamPart) TypeID() byte { return 'j' }
-func (p ReasoningSignatureStreamPart) Format() (string, error) {
-	return formatJSONPart(p)
+func (p ReasoningEndPart) Type() string { return "reasoning-end" }
+
+// SourceUrlPart provides a URL reference for a source.
+type SourceUrlPart struct {
+	SourceID string `json:"sourceId"`
+	URL      string `json:"url"`
 }
 
-// SourceStreamPart corresponds to TYPE_ID 'h'.
-type SourceStreamPart struct {
-	SourceType string `json:"sourceType"`
-	ID         string `json:"id"`
-	URL        string `json:"url"`
-	Title      string `json:"title"`
+func (p SourceUrlPart) Type() string { return "source-url" }
+
+// SourceDocumentPart provides document metadata for a source.
+type SourceDocumentPart struct {
+	SourceID  string `json:"sourceId"`
+	MediaType string `json:"mediaType"`
+	Title     string `json:"title"`
 }
 
-func (p SourceStreamPart) TypeID() byte { return 'h' }
-func (p SourceStreamPart) Format() (string, error) {
-	return formatJSONPart(p)
+func (p SourceDocumentPart) Type() string { return "source-document" }
+
+// FilePart provides file content via URL.
+type FilePart struct {
+	URL       string `json:"url"`
+	MediaType string `json:"mediaType"`
 }
 
-// FileStreamPart corresponds to TYPE_ID 'k'.
-type FileStreamPart struct {
-	Data     []byte `json:"data"`
-	MimeType string `json:"mimeType"`
+func (p FilePart) Type() string { return "file" }
+
+// DataPart provides custom data with a type suffix.
+type DataPart struct {
+	TypeSuffix string `json:"-"` // Not serialized, used to construct type
+	Data       any    `json:"data"`
 }
 
-func (p FileStreamPart) TypeID() byte { return 'k' }
-func (p FileStreamPart) Format() (string, error) {
-	return formatJSONPart(p)
+func (p DataPart) Type() string { return "data-" + p.TypeSuffix }
+
+// ErrorPart indicates an error occurred.
+type ErrorPart struct {
+	ErrorText string `json:"errorText"`
 }
 
-// DataStreamDataPart corresponds to TYPE_ID '2'.
-type DataStreamDataPart struct {
-	Content []any
-}
-
-func (p DataStreamDataPart) TypeID() byte { return '2' }
-func (p DataStreamDataPart) Format() (string, error) {
-	jsonContent, err := json.Marshal(p.Content)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal data content: %w", err)
-	}
-	return fmt.Sprintf("%c:%s\n", p.TypeID(), string(jsonContent)), nil
-}
-
-// MessageAnnotationStreamPart corresponds to TYPE_ID '8'.
-type MessageAnnotationStreamPart struct {
-	Content []any
-}
-
-func (p MessageAnnotationStreamPart) TypeID() byte { return '8' }
-func (p MessageAnnotationStreamPart) Format() (string, error) {
-	jsonContent, err := json.Marshal(p.Content)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal annotation content: %w", err)
-	}
-	return fmt.Sprintf("%c:%s\n", p.TypeID(), string(jsonContent)), nil
-}
-
-// ErrorStreamPart corresponds to TYPE_ID '3'.
-type ErrorStreamPart struct {
-	Content string
-}
-
-func (p ErrorStreamPart) TypeID() byte { return '3' }
-func (p ErrorStreamPart) Format() (string, error) {
-	jsonContent, err := json.Marshal(p.Content)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal error content: %w", err)
-	}
-	return fmt.Sprintf("%c:%s\n", p.TypeID(), string(jsonContent)), nil
-}
+func (p ErrorPart) Type() string { return "error" }
 
 // ToolCall represents a tool call *request*.
 type ToolCall struct {
@@ -302,60 +196,44 @@ type ToolCallResult interface {
 	Part | []Part | any
 }
 
-// ToolCallStartStreamPart corresponds to TYPE_ID 'b'.
-type ToolCallStartStreamPart struct {
+// ToolInputStartPart indicates the start of tool input.
+type ToolInputStartPart struct {
 	ToolCallID string `json:"toolCallId"`
 	ToolName   string `json:"toolName"`
 }
 
-func (p ToolCallStartStreamPart) TypeID() byte { return 'b' }
-func (p ToolCallStartStreamPart) Format() (string, error) {
-	return formatJSONPart(p)
+func (p ToolInputStartPart) Type() string { return "tool-input-start" }
+
+// ToolInputDeltaPart contains incremental tool input.
+type ToolInputDeltaPart struct {
+	ToolCallID     string `json:"toolCallId"`
+	InputTextDelta string `json:"inputTextDelta"`
 }
 
-// ToolCallDeltaStreamPart corresponds to TYPE_ID 'c'.
-type ToolCallDeltaStreamPart struct {
-	ToolCallID    string `json:"toolCallId"`
-	ArgsTextDelta string `json:"argsTextDelta"`
-}
+func (p ToolInputDeltaPart) Type() string { return "tool-input-delta" }
 
-func (p ToolCallDeltaStreamPart) TypeID() byte { return 'c' }
-func (p ToolCallDeltaStreamPart) Format() (string, error) {
-	return formatJSONPart(p)
-}
-
-// ToolCallStreamPart corresponds to TYPE_ID '9'.
-type ToolCallStreamPart struct {
+// ToolInputAvailablePart provides complete tool input.
+type ToolInputAvailablePart struct {
 	ToolCallID string         `json:"toolCallId"`
 	ToolName   string         `json:"toolName"`
-	Args       map[string]any `json:"args"`
+	Input      map[string]any `json:"input"`
 }
 
-func (p ToolCallStreamPart) TypeID() byte { return '9' }
-func (p ToolCallStreamPart) Format() (string, error) {
-	return formatJSONPart(p)
-}
+func (p ToolInputAvailablePart) Type() string { return "tool-input-available" }
 
-// ToolResultStreamPart corresponds to TYPE_ID 'a'.
-type ToolResultStreamPart struct {
+// ToolOutputAvailablePart provides tool output.
+type ToolOutputAvailablePart struct {
 	ToolCallID string `json:"toolCallId"`
-	Result     any    `json:"result"`
+	Output     any    `json:"output"`
 }
 
-func (p ToolResultStreamPart) TypeID() byte { return 'a' }
-func (p ToolResultStreamPart) Format() (string, error) {
-	return formatJSONPart(p)
-}
+func (p ToolOutputAvailablePart) Type() string { return "tool-output-available" }
 
 // StartStepStreamPart corresponds to TYPE_ID 'f'.
 type StartStepStreamPart struct {
-	MessageID string `json:"messageId"`
 }
 
-func (p StartStepStreamPart) TypeID() byte { return 'f' }
-func (p StartStepStreamPart) Format() (string, error) {
-	return formatJSONPart(p)
-}
+func (p StartStepStreamPart) Type() string { return "start-step" }
 
 // FinishReason defines the possible reasons for finishing a step or message.
 type FinishReason string
@@ -376,35 +254,39 @@ type Usage struct {
 	CompletionTokens *int64 `json:"completionTokens"`
 }
 
-// FinishStepStreamPart corresponds to TYPE_ID 'e'.
-type FinishStepStreamPart struct {
-	FinishReason FinishReason `json:"finishReason"`
-	Usage        Usage        `json:"usage"`
-	IsContinued  bool         `json:"isContinued"`
+// FinishStepPart indicates the completion of a step.
+type FinishStepPart struct {
+	FinishReason FinishReason `json:"finishReason,omitzero"`
+	Usage        Usage        `json:"usage,omitzero"`
+	IsContinued  bool         `json:"isContinued,omitzero"`
 }
 
-func (p FinishStepStreamPart) TypeID() byte { return 'e' }
-func (p FinishStepStreamPart) Format() (string, error) {
-	return formatJSONPart(p)
+func (p FinishStepPart) Type() string { return "finish-step" }
+
+// FinishPart indicates the completion of a message.
+type FinishPart struct {
+	FinishReason FinishReason `json:"finishReason,omitzero"`
+	Usage        Usage        `json:"usage,omitzero"`
 }
 
-// FinishMessageStreamPart corresponds to TYPE_ID 'd'.
-type FinishMessageStreamPart struct {
-	FinishReason FinishReason `json:"finishReason"`
-	Usage        Usage        `json:"usage"`
-}
-
-func (p FinishMessageStreamPart) TypeID() byte { return 'd' }
-func (p FinishMessageStreamPart) Format() (string, error) {
-	return formatJSONPart(p)
-}
+func (p FinishPart) Type() string { return "finish" }
 
 func formatJSONPart(part DataStreamPart) (string, error) {
 	jsonData, err := json.Marshal(part)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal part type %T: %w", part, err)
 	}
-	return fmt.Sprintf("%c:%s\n", part.TypeID(), string(jsonData)), nil
+	var document map[string]any
+	if err := json.Unmarshal(jsonData, &document); err != nil {
+		return "", fmt.Errorf("failed to unmarshal JSON for part type %T: %w", part, err)
+	}
+	document["type"] = part.Type()
+	finalData, err := json.Marshal(document)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal final JSON for part type %T: %w", part, err)
+	}
+
+	return string(finalData), nil
 }
 
 type Attachment struct {
@@ -459,7 +341,12 @@ type Part struct {
 	Details   []ReasoningDetail `json:"details,omitempty"`
 
 	// Type: "tool-invocation"
-	ToolInvocation *ToolInvocation `json:"toolInvocation,omitempty"`
+	ToolCallID string              `json:"toolCallId"`
+	ToolName   string              `json:"toolName"`
+	Input      any                 `json:"input"`
+	Output     any                 `json:"output,omitempty"`
+	State      ToolInvocationState `json:"state,omitempty"`
+	ErrorText  string              `json:"errorText,omitempty"`
 
 	// Type: "source"
 	Source *SourceInfo `json:"source,omitempty"`
@@ -471,12 +358,44 @@ type Part struct {
 	// Type: "step-start" - No additional fields
 
 	isComplete bool `json:"-"` // Internal accumulator tracking
+
+	ProviderMetadata *ProviderMetadata `json:"providerMetadata,omitzero"`
+}
+
+type ProviderMetadata struct {
+	Anthropic *AnthropicProviderMetadata `json:"anthropic,omitzero"`
+}
+
+type AnthropicProviderMetadata struct {
+	Signature string `json:"signature,omitempty"` // Optional signature for reasoning
+}
+
+func (p *Part) UnmarshalJSON(data []byte) error {
+	var justTheType struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &justTheType); err != nil {
+		return fmt.Errorf("failed to unmarshal part type: %w", err)
+	}
+
+	type normallySerializedPart Part
+
+	if err := json.Unmarshal(data, (*normallySerializedPart)(p)); err != nil {
+		return fmt.Errorf("failed to unmarshal part normally: %w", err)
+	}
+
+	if strings.HasPrefix(justTheType.Type, "tool-") {
+		p.Type = PartTypeToolInvocation
+		p.ToolName = strings.TrimPrefix(justTheType.Type, "tool-")
+	}
+
+	return nil
 }
 
 type Tool struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
-	Schema      Schema `json:"parameters"`
+	Schema      Schema `json:"schema"`
 }
 
 type Schema struct {
@@ -487,287 +406,18 @@ type Schema struct {
 type ToolInvocationState string
 
 const (
-	ToolInvocationStateCall        ToolInvocationState = "call"
-	ToolInvocationStatePartialCall ToolInvocationState = "partial-call"
-	ToolInvocationStateResult      ToolInvocationState = "result"
+	ToolInvocationStateCall            ToolInvocationState = "call"
+	ToolInvocationStatePartialCall     ToolInvocationState = "partial-call"
+	ToolInvocationStateResult          ToolInvocationState = "result"
+	ToolInvocationStateOutputAvailable ToolInvocationState = "output-available"
+	ToolInvocationStateOutputError     ToolInvocationState = "output-error"
 )
 
-type ToolInvocation struct {
-	State      ToolInvocationState `json:"state"`
-	Step       *int                `json:"step,omitempty"`
-	ToolCallID string              `json:"toolCallId"`
-	ToolName   string              `json:"toolName"`
-	Args       any                 `json:"args"`
-	Result     any                 `json:"result,omitempty"`
-}
-
 func WriteDataStreamHeaders(w http.ResponseWriter) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Header().Set("X-Vercel-AI-Data-Stream", "v1")
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("X-Vercel-AI-Data-Stream", "v2")
+	w.Header().Set("X-Accel-Buffering", "no") // Disable buffering for real-time streaming
 	w.WriteHeader(http.StatusOK)
-}
-
-// DataStreamAccumulator accumulates DataStreamParts into Messages.
-type DataStreamAccumulator struct {
-	messages       []Message
-	currentMessage *Message
-	wipToolCalls   map[string]*Part // Keyed by ToolCallID, points to Part in currentMessage.Parts
-	finishReason   FinishReason
-	usage          Usage
-}
-
-func (a *DataStreamAccumulator) ensureCurrentMessage() {
-	if a.currentMessage == nil {
-		a.currentMessage = &Message{
-			Role:  "assistant",
-			Parts: make([]Part, 0, 5),
-		}
-		a.wipToolCalls = make(map[string]*Part)
-	}
-}
-
-func (a *DataStreamAccumulator) findPart(toolCallID string) *Part {
-	if a.currentMessage == nil {
-		return nil
-	}
-	for i := range a.currentMessage.Parts {
-		if a.currentMessage.Parts[i].Type == PartTypeToolInvocation &&
-			a.currentMessage.Parts[i].ToolInvocation != nil &&
-			a.currentMessage.Parts[i].ToolInvocation.ToolCallID == toolCallID {
-			return &a.currentMessage.Parts[i]
-		}
-	}
-	return nil
-}
-
-func (a *DataStreamAccumulator) Push(part DataStreamPart) error {
-	if _, isFinal := part.(FinishMessageStreamPart); !isFinal {
-		a.ensureCurrentMessage()
-	}
-
-	var currentMsgPtr *Message
-	if a.currentMessage != nil {
-		currentMsgPtr = a.currentMessage
-	}
-
-	switch p := part.(type) {
-	case TextStreamPart:
-		if currentMsgPtr == nil {
-			return fmt.Errorf("cannot add TextStreamPart without an active message")
-		}
-		currentMsgPtr.Content += p.Content
-		numParts := len(currentMsgPtr.Parts)
-		if numParts > 0 && currentMsgPtr.Parts[numParts-1].Type == PartTypeText {
-			currentMsgPtr.Parts[numParts-1].Text += p.Content
-		} else {
-			currentMsgPtr.Parts = append(currentMsgPtr.Parts, Part{
-				Type: PartTypeText,
-				Text: p.Content,
-			})
-		}
-
-	case ReasoningStreamPart:
-		if currentMsgPtr == nil {
-			return fmt.Errorf("cannot add ReasoningStreamPart without an active message")
-		}
-		var reasoningPart *Part
-		for i := range currentMsgPtr.Parts {
-			if currentMsgPtr.Parts[i].Type == PartTypeReasoning {
-				reasoningPart = &currentMsgPtr.Parts[i]
-				break
-			}
-		}
-		if reasoningPart == nil {
-			currentMsgPtr.Parts = append(currentMsgPtr.Parts, Part{Type: PartTypeReasoning})
-			reasoningPart = &currentMsgPtr.Parts[len(currentMsgPtr.Parts)-1]
-		}
-		reasoningPart.Reasoning += p.Content
-
-	case FileStreamPart:
-		if currentMsgPtr == nil {
-			return fmt.Errorf("cannot add FileStreamPart without an active message")
-		}
-		currentMsgPtr.Parts = append(currentMsgPtr.Parts, Part{
-			Type:     PartTypeFile,
-			MimeType: p.MimeType,
-			Data:     p.Data,
-		})
-
-	case SourceStreamPart:
-		if currentMsgPtr == nil {
-			return fmt.Errorf("cannot add SourceStreamPart without an active message")
-		}
-		currentMsgPtr.Parts = append(currentMsgPtr.Parts, Part{
-			Type: PartTypeSource,
-			Source: &SourceInfo{
-				URI:         p.URL,
-				ContentType: "",
-				Data:        "",
-				Metadata:    map[string]any{"id": p.ID, "title": p.Title, "sourceType": p.SourceType},
-			},
-		})
-
-	case StartStepStreamPart:
-		if currentMsgPtr == nil {
-			return fmt.Errorf("StartStepStreamPart received before message initialization")
-		}
-		if currentMsgPtr.ID == "" {
-			currentMsgPtr.ID = p.MessageID
-		}
-		currentMsgPtr.Parts = append(currentMsgPtr.Parts, Part{Type: PartTypeStepStart})
-
-	case ToolCallStartStreamPart:
-		if currentMsgPtr == nil {
-			return fmt.Errorf("cannot add ToolCallStartStreamPart without an active message")
-		}
-		// Initialize a new tool call
-		newPart := Part{
-			Type: PartTypeToolInvocation,
-			ToolInvocation: &ToolInvocation{
-				State:      ToolInvocationStatePartialCall,
-				ToolCallID: p.ToolCallID,
-				ToolName:   p.ToolName,
-				Args:       "",
-			},
-			isComplete: false,
-		}
-		currentMsgPtr.Parts = append(currentMsgPtr.Parts, newPart)
-		a.wipToolCalls[p.ToolCallID] = &currentMsgPtr.Parts[len(currentMsgPtr.Parts)-1]
-
-	case ToolCallDeltaStreamPart:
-		if currentMsgPtr == nil {
-			return fmt.Errorf("cannot add ToolCallDeltaStreamPart without an active message")
-		}
-		wipCallPart, exists := a.wipToolCalls[p.ToolCallID]
-		if exists && wipCallPart.ToolInvocation != nil {
-			if argsStr, ok := wipCallPart.ToolInvocation.Args.(string); ok {
-				wipCallPart.ToolInvocation.Args = argsStr + p.ArgsTextDelta
-			} else {
-				return fmt.Errorf("tool call delta received for non-string args (ID: %s)", p.ToolCallID)
-			}
-		}
-
-	case ToolCallStreamPart:
-		if currentMsgPtr == nil {
-			return fmt.Errorf("cannot add ToolCallStreamPart without an active message")
-		}
-		// Update or create tool call
-		existingPart := a.findPart(p.ToolCallID)
-		if existingPart != nil && existingPart.ToolInvocation != nil {
-			existingPart.ToolInvocation.ToolName = p.ToolName
-			existingPart.ToolInvocation.Args = p.Args
-			existingPart.ToolInvocation.State = ToolInvocationStateCall
-			existingPart.isComplete = true
-		} else {
-			currentMsgPtr.Parts = append(currentMsgPtr.Parts, Part{
-				Type: PartTypeToolInvocation,
-				ToolInvocation: &ToolInvocation{
-					State:      ToolInvocationStateCall,
-					ToolCallID: p.ToolCallID,
-					ToolName:   p.ToolName,
-					Args:       p.Args,
-				},
-				isComplete: true,
-			})
-		}
-		delete(a.wipToolCalls, p.ToolCallID)
-
-	case ToolResultStreamPart:
-		if currentMsgPtr == nil {
-			return fmt.Errorf("cannot add ToolResultStreamPart without an active message")
-		}
-		// Find and update existing tool call with result
-		existingPart := a.findPart(p.ToolCallID)
-		if existingPart != nil && existingPart.ToolInvocation != nil {
-			existingPart.ToolInvocation.State = ToolInvocationStateResult
-			existingPart.ToolInvocation.Result = p.Result
-		} else {
-			return fmt.Errorf("tool result received for unknown tool call ID: %s", p.ToolCallID)
-		}
-
-	case DataStreamDataPart:
-		if currentMsgPtr == nil {
-			return fmt.Errorf("cannot add DataStreamDataPart without an active message")
-		}
-		currentMsgPtr.Annotations = append(currentMsgPtr.Annotations, p.Content...)
-
-	case MessageAnnotationStreamPart:
-		if currentMsgPtr == nil {
-			return fmt.Errorf("cannot add MessageAnnotationStreamPart without an active message")
-		}
-		currentMsgPtr.Annotations = append(currentMsgPtr.Annotations, p.Content...)
-
-	case FinishStepStreamPart:
-		if currentMsgPtr != nil {
-			// Clean up any remaining WIP tool calls
-			for id, wipCallPart := range a.wipToolCalls {
-				if !wipCallPart.isComplete && wipCallPart.ToolInvocation != nil {
-					if argsStr, ok := wipCallPart.ToolInvocation.Args.(string); ok && argsStr != "" {
-						var parsedArgs map[string]any
-						if json.Unmarshal([]byte(argsStr), &parsedArgs) == nil {
-							wipCallPart.ToolInvocation.Args = parsedArgs
-							wipCallPart.ToolInvocation.State = ToolInvocationStateCall
-						}
-					}
-					wipCallPart.isComplete = true
-				}
-				delete(a.wipToolCalls, id)
-			}
-
-			if !p.IsContinued {
-				a.messages = append(a.messages, *currentMsgPtr)
-				a.currentMessage = nil
-				a.wipToolCalls = nil
-			}
-		}
-		a.finishReason = p.FinishReason
-
-	case FinishMessageStreamPart:
-		if currentMsgPtr != nil {
-			// Clean up any remaining WIP tool calls
-			for _, wipCallPart := range a.wipToolCalls {
-				if !wipCallPart.isComplete && wipCallPart.ToolInvocation != nil {
-					if argsStr, ok := wipCallPart.ToolInvocation.Args.(string); ok && argsStr != "" {
-						var parsedArgs map[string]any
-						if json.Unmarshal([]byte(argsStr), &parsedArgs) == nil {
-							wipCallPart.ToolInvocation.Args = parsedArgs
-							wipCallPart.ToolInvocation.State = ToolInvocationStateCall
-						}
-					}
-					wipCallPart.isComplete = true
-				}
-			}
-			a.messages = append(a.messages, *currentMsgPtr)
-		}
-		a.finishReason = p.FinishReason
-		a.currentMessage = nil
-		a.wipToolCalls = nil
-		a.usage = p.Usage
-
-	case ErrorStreamPart:
-		a.finishReason = FinishReasonError
-		return fmt.Errorf("error in stream: %s", p.Content)
-
-	case RedactedReasoningStreamPart, ReasoningSignatureStreamPart:
-		// No action needed for accumulation
-
-	default:
-		return fmt.Errorf("unhandled part type: %T", part)
-	}
-
-	return nil
-}
-
-func (a *DataStreamAccumulator) Messages() []Message {
-	return a.messages
-}
-
-func (a *DataStreamAccumulator) FinishReason() FinishReason {
-	return a.finishReason
-}
-
-func (a *DataStreamAccumulator) Usage() Usage {
-	return a.usage
 }
 
 func toolResultToParts(result any) ([]Part, error) {

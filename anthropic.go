@@ -73,6 +73,13 @@ func MessagesToAnthropic(messages []Message) ([]anthropic.MessageParam, []anthro
 		case "assistant":
 			for _, part := range message.Parts {
 				switch part.Type {
+				case PartTypeReasoning:
+					content = append(content, anthropic.ContentBlockParamUnion{
+						OfThinking: &anthropic.ThinkingBlockParam{
+							Thinking:  part.Text,
+							Signature: part.ProviderMetadata.Anthropic.Signature,
+						},
+					})
 				case PartTypeText:
 					content = append(content, anthropic.ContentBlockParamUnion{
 						OfText: &anthropic.TextBlockParam{
@@ -80,22 +87,22 @@ func MessagesToAnthropic(messages []Message) ([]anthropic.MessageParam, []anthro
 						},
 					})
 				case PartTypeToolInvocation:
-					if part.ToolInvocation == nil {
-						return nil, nil, fmt.Errorf("assistant message part has type tool-invocation but nil ToolInvocation field (ID: %s)", message.ID)
+					if part.Input == nil {
+						part.Input = make(map[string]any)
 					}
-					argsJSON, err := json.Marshal(part.ToolInvocation.Args)
+					argsJSON, err := json.Marshal(part.Input)
 					if err != nil {
-						return nil, nil, fmt.Errorf("marshalling tool input for call %s: %w", part.ToolInvocation.ToolCallID, err)
+						return nil, nil, fmt.Errorf("marshalling tool input for call %s: %w", part.ToolCallID, err)
 					}
 					content = append(content, anthropic.ContentBlockParamUnion{
 						OfToolUse: &anthropic.ToolUseBlockParam{
-							ID:    part.ToolInvocation.ToolCallID,
+							ID:    part.ToolCallID,
 							Input: json.RawMessage(argsJSON),
-							Name:  part.ToolInvocation.ToolName,
+							Name:  part.ToolName,
 						},
 					})
 
-					if part.ToolInvocation.State != ToolInvocationStateResult {
+					if part.State != ToolInvocationStateOutputAvailable && part.State != ToolInvocationStateOutputError {
 						continue
 					}
 
@@ -107,27 +114,34 @@ func MessagesToAnthropic(messages []Message) ([]anthropic.MessageParam, []anthro
 					content = nil
 
 					resultContent := []anthropic.ToolResultBlockParamContentUnion{}
-					resultParts, err := toolResultToParts(part.ToolInvocation.Result)
-					if err != nil {
-						return nil, nil, fmt.Errorf("failed to convert tool call result to parts: %w", err)
-					}
-					for _, resultPart := range resultParts {
-						switch resultPart.Type {
-						case PartTypeText:
-							resultContent = append(resultContent, anthropic.ToolResultBlockParamContentUnion{
-								OfText: &anthropic.TextBlockParam{Text: resultPart.Text},
-							})
-						case PartTypeFile:
-							resultContent = append(resultContent, anthropic.ToolResultBlockParamContentUnion{
-								OfImage: &anthropic.ImageBlockParam{
-									Source: anthropic.ImageBlockParamSourceUnion{
-										OfBase64: &anthropic.Base64ImageSourceParam{
-											Data:      base64.StdEncoding.EncodeToString(resultPart.Data),
-											MediaType: anthropic.Base64ImageSourceMediaType(resultPart.MimeType),
+
+					if part.State == ToolInvocationStateOutputError {
+						resultContent = append(resultContent, anthropic.ToolResultBlockParamContentUnion{
+							OfText: &anthropic.TextBlockParam{Text: part.ErrorText},
+						})
+					} else {
+						resultParts, err := toolResultToParts(part.Output)
+						if err != nil {
+							return nil, nil, fmt.Errorf("failed to convert tool call result to parts: %w", err)
+						}
+						for _, resultPart := range resultParts {
+							switch resultPart.Type {
+							case PartTypeText:
+								resultContent = append(resultContent, anthropic.ToolResultBlockParamContentUnion{
+									OfText: &anthropic.TextBlockParam{Text: resultPart.Text},
+								})
+							case PartTypeFile:
+								resultContent = append(resultContent, anthropic.ToolResultBlockParamContentUnion{
+									OfImage: &anthropic.ImageBlockParam{
+										Source: anthropic.ImageBlockParamSourceUnion{
+											OfBase64: &anthropic.Base64ImageSourceParam{
+												Data:      base64.StdEncoding.EncodeToString(resultPart.Data),
+												MediaType: anthropic.Base64ImageSourceMediaType(resultPart.MimeType),
+											},
 										},
 									},
-								},
-							})
+								})
+							}
 						}
 					}
 
@@ -137,7 +151,7 @@ func MessagesToAnthropic(messages []Message) ([]anthropic.MessageParam, []anthro
 						Content: []anthropic.ContentBlockParamUnion{
 							{
 								OfToolResult: &anthropic.ToolResultBlockParam{
-									ToolUseID: part.ToolInvocation.ToolCallID,
+									ToolUseID: part.ToolCallID,
 									Content:   resultContent,
 								},
 							},
@@ -205,14 +219,29 @@ func MessagesToAnthropic(messages []Message) ([]anthropic.MessageParam, []anthro
 }
 
 // AnthropicToDataStream pipes an Anthropic stream to a DataStream.
-func AnthropicToDataStream(stream *ssestream.Stream[anthropic.MessageStreamEventUnion]) DataStream {
-	return func(yield func(DataStreamPart, error) bool) {
+func AnthropicToDataStream(stream *ssestream.Stream[anthropic.MessageStreamEventUnion]) (DataStream, func() anthropic.Usage) {
+	usage := anthropic.Usage{}
+
+	getUsage := func() anthropic.Usage {
+		return usage
+	}
+
+	dataStream := func(yield func(DataStreamPart, error) bool) {
 		var lastChunk *anthropic.MessageStreamEventUnion
 		var finalReason FinishReason = FinishReasonUnknown
-		var finalUsage Usage
+		// var finalUsage Usage
 		var currentToolCall struct {
 			ID   string
+			Name string
 			Args string
+		}
+
+		currentContentBlockType := ""
+		currentContentBlockID := 0
+		currentContentBlockIDText := "0"
+		bumpContentBlockID := func() {
+			currentContentBlockID++
+			currentContentBlockIDText = fmt.Sprintf("%d", currentContentBlockID)
 		}
 
 		for stream.Next() {
@@ -222,60 +251,128 @@ func AnthropicToDataStream(stream *ssestream.Stream[anthropic.MessageStreamEvent
 			event := chunk.AsAny()
 			switch event := event.(type) {
 			case anthropic.MessageStartEvent:
-				if !yield(StartStepStreamPart{
-					MessageID: event.Message.ID,
-				}, nil) {
+				usage = event.Message.Usage
+
+				if !yield(MessageStartPart{}, nil) {
+					return
+				}
+
+				if !yield(StartStepStreamPart{}, nil) {
 					return
 				}
 
 			case anthropic.ContentBlockDeltaEvent:
 				switch delta := event.Delta.AsAny().(type) {
 				case anthropic.TextDelta:
-					if !yield(TextStreamPart{Content: delta.Text}, nil) {
+					if !yield(TextDeltaPart{
+						ID:    currentContentBlockIDText,
+						Delta: delta.Text,
+					}, nil) {
+						return
+					}
+				case anthropic.SignatureDelta:
+					if !yield(ReasoningDeltaPart{
+						ID: currentContentBlockIDText,
+						ProviderMetadata: ProviderMetadata{
+							Anthropic: &AnthropicProviderMetadata{
+								Signature: delta.Signature,
+							},
+						},
+					}, nil) {
+						return
+					}
+				case anthropic.ThinkingDelta:
+					if !yield(ReasoningDeltaPart{
+						ID:    currentContentBlockIDText,
+						Delta: delta.Thinking,
+					}, nil) {
 						return
 					}
 				case anthropic.InputJSONDelta:
 					// Accumulate the arguments for the current tool call
 					currentToolCall.Args += delta.PartialJSON
-					if !yield(ToolCallDeltaStreamPart{
-						ToolCallID:    currentToolCall.ID,
-						ArgsTextDelta: delta.PartialJSON,
+					if !yield(ToolInputDeltaPart{
+						ToolCallID:     currentToolCall.ID,
+						InputTextDelta: delta.PartialJSON,
 					}, nil) {
-						return
-					}
-				case anthropic.ThinkingDelta:
-					if !yield(ReasoningStreamPart{Content: delta.Thinking}, nil) {
 						return
 					}
 				}
 
 			case anthropic.ContentBlockStartEvent:
-				if block, ok := event.ContentBlock.AsAny().(anthropic.ToolUseBlock); ok {
+				switch block := event.ContentBlock.AsAny().(type) {
+				case anthropic.ThinkingBlock:
+					if !yield(ReasoningStartPart{
+						ID: currentContentBlockIDText,
+					}, nil) {
+						return
+					}
+					currentContentBlockType = "thinking"
+				case anthropic.TextBlock:
+					if !yield(TextStartPart{
+						ID: currentContentBlockIDText,
+					}, nil) {
+						return
+					}
+					currentContentBlockType = "text"
+				case anthropic.ToolUseBlock:
 					currentToolCall.ID = block.ID
+					currentToolCall.Name = block.Name
 					currentToolCall.Args = ""
 
-					if !yield(ToolCallStartStreamPart{
+					if !yield(ToolInputStartPart{
 						ToolCallID: block.ID,
 						ToolName:   block.Name,
 					}, nil) {
 						return
 					}
+					currentContentBlockType = "tool_use"
 				}
 
-			case anthropic.MessageDeltaEvent:
-				if event.Delta.StopReason == "tool_use" {
-					finalReason = FinishReasonToolCalls
-					if event.Usage.OutputTokens != 0 {
-						tokens := event.Usage.OutputTokens
-						finalUsage.CompletionTokens = &tokens
+			case anthropic.ContentBlockStopEvent:
+				switch currentContentBlockType {
+				case "thinking":
+					if !yield(ReasoningEndPart{
+						ID: currentContentBlockIDText,
+					}, nil) {
+						return
+					}
+					bumpContentBlockID()
+				case "text":
+					if !yield(TextEndPart{
+						ID: currentContentBlockIDText,
+					}, nil) {
+						return
+					}
+					bumpContentBlockID()
+				case "tool_use":
+					var input map[string]any
+					if currentToolCall.Args != "" {
+						if err := json.Unmarshal([]byte(currentToolCall.Args), &input); err != nil {
+							yield(nil, fmt.Errorf("unmarshalling tool input for call %s %q: %w", currentToolCall.ID, currentToolCall.Args, err))
+							return
+						}
+					}
+
+					if !yield(ToolInputAvailablePart{
+						ToolCallID: currentToolCall.ID,
+						ToolName:   currentToolCall.Name,
+						Input:      input,
+					}, nil) {
+						return
 					}
 
 					// Reset current tool call after emitting the final delta
 					currentToolCall = struct {
 						ID   string
+						Name string
 						Args string
 					}{}
+
 				}
+
+			case anthropic.MessageDeltaEvent:
+				usage.OutputTokens += event.Usage.OutputTokens
 
 			case anthropic.MessageStopEvent:
 				// Determine final reason if not already set by tool_use
@@ -284,19 +381,12 @@ func AnthropicToDataStream(stream *ssestream.Stream[anthropic.MessageStreamEvent
 				}
 
 				// Send final finish step
-				if !yield(FinishStepStreamPart{
-					FinishReason: finalReason,
-					Usage:        finalUsage,
-					IsContinued:  false,
-				}, nil) {
+				if !yield(FinishStepPart{}, nil) {
 					return
 				}
 
 				// Send final finish message
-				if !yield(FinishMessageStreamPart{
-					FinishReason: finalReason,
-					Usage:        finalUsage,
-				}, nil) {
+				if !yield(FinishPart{}, nil) {
 					return
 				}
 			}
@@ -315,10 +405,14 @@ func AnthropicToDataStream(stream *ssestream.Stream[anthropic.MessageStreamEvent
 				finalReason = FinishReasonError // Indicate abnormal termination
 			}
 
-			yield(FinishMessageStreamPart{
-				FinishReason: finalReason,
-				Usage:        finalUsage,
+			yield(FinishStepPart{}, nil)
+
+			yield(FinishPart{
+				// FinishReason: finalReason,
+				// Usage:        finalUsage,
 			}, nil)
 		}
 	}
+
+	return dataStream, getUsage
 }
