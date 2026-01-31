@@ -24,7 +24,7 @@ func SendSingleDataStreamPart(w io.Writer, part DataStreamPart) error {
 	if err != nil {
 		return fmt.Errorf("failed to format part: %w", err)
 	}
-	_, err = fmt.Fprint(w, fmt.Sprintf("data: %s\n\n", messageJson))
+	_, err = fmt.Fprintf(w, "data: %s\n\n", messageJson)
 	if err != nil {
 		return fmt.Errorf("failed to write part to writer: %w", err)
 	}
@@ -43,7 +43,7 @@ func (s DataStream) Pipe(w io.Writer) error {
 		if err != nil {
 			errorPart := ErrorPart{ErrorText: err.Error()}
 			if messageJson, formatErr := formatJSONPart(errorPart); formatErr == nil {
-				fmt.Fprint(w, fmt.Sprintf("data: %s\n\n", messageJson))
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", messageJson)
 				if flusher != nil {
 					flusher.Flush()
 				}
@@ -55,7 +55,7 @@ func (s DataStream) Pipe(w io.Writer) error {
 		if err != nil {
 			errorPart := ErrorPart{ErrorText: fmt.Sprintf("failed to format part: %s", err.Error())}
 			if errorJson, formatErr := formatJSONPart(errorPart); formatErr == nil {
-				fmt.Fprint(w, fmt.Sprintf("data: %s\n\n", errorJson))
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", errorJson)
 				if flusher != nil {
 					flusher.Flush()
 				}
@@ -63,7 +63,7 @@ func (s DataStream) Pipe(w io.Writer) error {
 			pipeErr = err
 			return false
 		}
-		_, err = fmt.Fprint(w, fmt.Sprintf("data: %s\n\n", messageJson))
+		_, err = fmt.Fprintf(w, "data: %s\n\n", messageJson)
 		if err != nil {
 			pipeErr = err
 			return false
@@ -255,18 +255,13 @@ type Usage struct {
 }
 
 // FinishStepPart indicates the completion of a step.
-type FinishStepPart struct {
-	FinishReason FinishReason `json:"finishReason,omitzero"`
-	Usage        Usage        `json:"usage,omitzero"`
-	IsContinued  bool         `json:"isContinued,omitzero"`
-}
+type FinishStepPart struct{}
 
 func (p FinishStepPart) Type() string { return "finish-step" }
 
 // FinishPart indicates the completion of a message.
 type FinishPart struct {
 	FinishReason FinishReason `json:"finishReason,omitzero"`
-	Usage        Usage        `json:"usage,omitzero"`
 }
 
 func (p FinishPart) Type() string { return "finish" }
@@ -356,8 +351,6 @@ type Part struct {
 	Data     []byte `json:"data,omitempty"`
 
 	// Type: "step-start" - No additional fields
-
-	isComplete bool `json:"-"` // Internal accumulator tracking
 
 	ProviderMetadata *ProviderMetadata `json:"providerMetadata,omitzero"`
 }
