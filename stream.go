@@ -214,9 +214,10 @@ func (p ToolInputDeltaPart) Type() string { return "tool-input-delta" }
 
 // ToolInputAvailablePart provides complete tool input.
 type ToolInputAvailablePart struct {
-	ToolCallID string         `json:"toolCallId"`
-	ToolName   string         `json:"toolName"`
-	Input      map[string]any `json:"input"`
+	ToolCallID       string           `json:"toolCallId"`
+	ToolName         string           `json:"toolName"`
+	Input            map[string]any   `json:"input"`
+	ProviderMetadata ProviderMetadata `json:"providerMetadata,omitzero"`
 }
 
 func (p ToolInputAvailablePart) Type() string { return "tool-input-available" }
@@ -357,10 +358,15 @@ type Part struct {
 
 type ProviderMetadata struct {
 	Anthropic *AnthropicProviderMetadata `json:"anthropic,omitzero"`
+	Google    *GoogleProviderMetadata    `json:"google,omitzero"`
 }
 
 type AnthropicProviderMetadata struct {
 	Signature string `json:"signature,omitempty"` // Optional signature for reasoning
+}
+
+type GoogleProviderMetadata struct {
+	ThoughtSignature []byte `json:"thoughtSignature,omitempty"` // Thought signature for function calls (Gemini 3+)
 }
 
 func (p *Part) UnmarshalJSON(data []byte) error {

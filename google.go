@@ -176,9 +176,17 @@ func MessagesToGoogle(messages []Message) ([]*genai.Content, error) {
 						Name: part.ToolName,
 						Args: argsMap,
 					}
-					content.Parts = append(content.Parts, &genai.Part{
+					// Create the part with function call
+					genaiPart := &genai.Part{
 						FunctionCall: &fc,
-					})
+					}
+
+					// Include thought signature if present in provider metadata
+					if part.ProviderMetadata != nil && part.ProviderMetadata.Google != nil {
+						genaiPart.ThoughtSignature = part.ProviderMetadata.Google.ThoughtSignature
+					}
+
+					content.Parts = append(content.Parts, genaiPart)
 
 					if part.State != ToolInvocationStateOutputAvailable && part.State != ToolInvocationStateOutputError {
 						continue
@@ -334,10 +342,19 @@ func GoogleToDataStream(stream iter.Seq2[*genai.GenerateContentResponse, error])
 						}
 					}
 
+					// Build provider metadata if thought signature is present
+					var providerMetadata ProviderMetadata
+					if len(part.ThoughtSignature) > 0 {
+						providerMetadata.Google = &GoogleProviderMetadata{
+							ThoughtSignature: part.ThoughtSignature,
+						}
+					}
+
 					if !yield(ToolInputAvailablePart{
-						ToolCallID: toolCallID,
-						ToolName:   fc.Name,
-						Input:      fc.Args,
+						ToolCallID:       toolCallID,
+						ToolName:         fc.Name,
+						Input:            fc.Args,
+						ProviderMetadata: providerMetadata,
 					}, nil) {
 						return
 					}
