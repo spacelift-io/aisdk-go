@@ -22,7 +22,9 @@ func ToolsToGoogle(tools []Tool) ([]*genai.Tool, error) {
 
 	var propertyToSchema func(property map[string]any) (*genai.Schema, error)
 	propertyToSchema = func(property map[string]any) (*genai.Schema, error) {
-		schema := &genai.Schema{}
+		schema := &genai.Schema{
+			Properties: make(map[string]*genai.Schema),
+		}
 
 		typeRaw, ok := property["type"]
 		if ok {
@@ -48,6 +50,7 @@ func ToolsToGoogle(tools []Tool) ([]*genai.Tool, error) {
 			if !ok {
 				return nil, fmt.Errorf("properties is not a map[string]any: %T", propertiesRaw)
 			}
+
 			for key, value := range properties {
 				propMap, ok := value.(map[string]any)
 				if !ok {
