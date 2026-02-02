@@ -111,6 +111,7 @@ func MessagesToAnthropic(messages []Message) ([]anthropic.MessageParam, []anthro
 						Role:    role,
 						Content: content,
 					})
+					content = nil
 
 					resultContent := []anthropic.ToolResultBlockParamContentUnion{}
 
@@ -156,7 +157,6 @@ func MessagesToAnthropic(messages []Message) ([]anthropic.MessageParam, []anthro
 							},
 						},
 					})
-					content = nil
 				}
 			}
 		case "user":
