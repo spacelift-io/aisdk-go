@@ -377,15 +377,23 @@ func (p *Part) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("failed to unmarshal part type: %w", err)
 	}
 
-	type normallySerializedPart Part
+	type alias Part
+	temp := struct {
+		*alias
+		// CallProviderMetadata seems to be sent for tool-invocation parts wheras
+		// all the other parts use regular ProviderMetadata. So this is a workaround
+		// to unmarshal both cases into the same field.
+		CallProviderMetadata *ProviderMetadata `json:"callProviderMetadata"`
+	}{alias: (*alias)(p)}
 
-	if err := json.Unmarshal(data, (*normallySerializedPart)(p)); err != nil {
+	if err := json.Unmarshal(data, &temp); err != nil {
 		return fmt.Errorf("failed to unmarshal part normally: %w", err)
 	}
 
 	if strings.HasPrefix(justTheType.Type, "tool-") {
 		p.Type = PartTypeToolInvocation
 		p.ToolName = strings.TrimPrefix(justTheType.Type, "tool-")
+		p.ProviderMetadata = temp.CallProviderMetadata
 	}
 
 	return nil
