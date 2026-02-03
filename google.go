@@ -282,10 +282,6 @@ func GoogleToDataStream(stream iter.Seq2[*genai.GenerateContentResponse, error])
 
 			if !messageStarted {
 				messageStarted = true
-				// messageID := resp.ResponseID
-				// if messageID == "" {
-				// 	messageID = uuid.New().String()
-				// }
 				if !yield(MessageStartPart{}, nil) {
 					return
 				}
