@@ -24,7 +24,7 @@ func SendSingleDataStreamPart(w io.Writer, part DataStreamPart) error {
 	if err != nil {
 		return fmt.Errorf("failed to format part: %w", err)
 	}
-	_, err = fmt.Fprint(w, fmt.Sprintf("data: %s\n\n", messageJson))
+	_, err = fmt.Fprintf(w, "data: %s\n\n", messageJson)
 	if err != nil {
 		return fmt.Errorf("failed to write part to writer: %w", err)
 	}
@@ -43,7 +43,7 @@ func (s DataStream) Pipe(w io.Writer) error {
 		if err != nil {
 			errorPart := ErrorPart{ErrorText: err.Error()}
 			if messageJson, formatErr := formatJSONPart(errorPart); formatErr == nil {
-				fmt.Fprint(w, fmt.Sprintf("data: %s\n\n", messageJson))
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", messageJson)
 				if flusher != nil {
 					flusher.Flush()
 				}
@@ -55,7 +55,7 @@ func (s DataStream) Pipe(w io.Writer) error {
 		if err != nil {
 			errorPart := ErrorPart{ErrorText: fmt.Sprintf("failed to format part: %s", err.Error())}
 			if errorJson, formatErr := formatJSONPart(errorPart); formatErr == nil {
-				fmt.Fprint(w, fmt.Sprintf("data: %s\n\n", errorJson))
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", errorJson)
 				if flusher != nil {
 					flusher.Flush()
 				}
@@ -63,7 +63,7 @@ func (s DataStream) Pipe(w io.Writer) error {
 			pipeErr = err
 			return false
 		}
-		_, err = fmt.Fprint(w, fmt.Sprintf("data: %s\n\n", messageJson))
+		_, err = fmt.Fprintf(w, "data: %s\n\n", messageJson)
 		if err != nil {
 			pipeErr = err
 			return false
@@ -214,9 +214,10 @@ func (p ToolInputDeltaPart) Type() string { return "tool-input-delta" }
 
 // ToolInputAvailablePart provides complete tool input.
 type ToolInputAvailablePart struct {
-	ToolCallID string         `json:"toolCallId"`
-	ToolName   string         `json:"toolName"`
-	Input      map[string]any `json:"input"`
+	ToolCallID       string           `json:"toolCallId"`
+	ToolName         string           `json:"toolName"`
+	Input            map[string]any   `json:"input"`
+	ProviderMetadata ProviderMetadata `json:"providerMetadata,omitzero"`
 }
 
 func (p ToolInputAvailablePart) Type() string { return "tool-input-available" }
@@ -255,18 +256,13 @@ type Usage struct {
 }
 
 // FinishStepPart indicates the completion of a step.
-type FinishStepPart struct {
-	FinishReason FinishReason `json:"finishReason,omitzero"`
-	Usage        Usage        `json:"usage,omitzero"`
-	IsContinued  bool         `json:"isContinued,omitzero"`
-}
+type FinishStepPart struct{}
 
 func (p FinishStepPart) Type() string { return "finish-step" }
 
 // FinishPart indicates the completion of a message.
 type FinishPart struct {
 	FinishReason FinishReason `json:"finishReason,omitzero"`
-	Usage        Usage        `json:"usage,omitzero"`
 }
 
 func (p FinishPart) Type() string { return "finish" }
@@ -357,17 +353,20 @@ type Part struct {
 
 	// Type: "step-start" - No additional fields
 
-	isComplete bool `json:"-"` // Internal accumulator tracking
-
 	ProviderMetadata *ProviderMetadata `json:"providerMetadata,omitzero"`
 }
 
 type ProviderMetadata struct {
 	Anthropic *AnthropicProviderMetadata `json:"anthropic,omitzero"`
+	Google    *GoogleProviderMetadata    `json:"google,omitzero"`
 }
 
 type AnthropicProviderMetadata struct {
 	Signature string `json:"signature,omitempty"` // Optional signature for reasoning
+}
+
+type GoogleProviderMetadata struct {
+	ThoughtSignature []byte `json:"thoughtSignature,omitempty"` // Thought signature for function calls (Gemini 3+)
 }
 
 func (p *Part) UnmarshalJSON(data []byte) error {
@@ -378,15 +377,23 @@ func (p *Part) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("failed to unmarshal part type: %w", err)
 	}
 
-	type normallySerializedPart Part
+	type alias Part
+	temp := struct {
+		*alias
+		// CallProviderMetadata seems to be sent for tool-invocation parts wheras
+		// all the other parts use regular ProviderMetadata. So this is a workaround
+		// to unmarshal both cases into the same field.
+		CallProviderMetadata *ProviderMetadata `json:"callProviderMetadata"`
+	}{alias: (*alias)(p)}
 
-	if err := json.Unmarshal(data, (*normallySerializedPart)(p)); err != nil {
+	if err := json.Unmarshal(data, &temp); err != nil {
 		return fmt.Errorf("failed to unmarshal part normally: %w", err)
 	}
 
 	if strings.HasPrefix(justTheType.Type, "tool-") {
 		p.Type = PartTypeToolInvocation
 		p.ToolName = strings.TrimPrefix(justTheType.Type, "tool-")
+		p.ProviderMetadata = temp.CallProviderMetadata
 	}
 
 	return nil
