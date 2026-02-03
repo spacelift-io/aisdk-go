@@ -200,11 +200,11 @@ func OpenAIToDataStream(stream *ssestream.Stream[openai.ChatCompletionChunk]) (D
 				return true
 			}
 			messageStarted = true
-			messageID := ""
-			if chunk != nil {
-				messageID = chunk.ID
-			}
-			if !yield(MessageStartPart{MessageID: messageID}, nil) {
+			// messageID := ""
+			// if chunk != nil {
+			// 	messageID = chunk.ID
+			// }
+			if !yield(MessageStartPart{}, nil) {
 				return false
 			}
 			if !yield(StartStepStreamPart{}, nil) {
