@@ -84,6 +84,7 @@ func MessagesToOpenAI(messages []Message) ([]openai.ChatCompletionMessageParamUn
 			})
 		case "assistant":
 			content := &openai.ChatCompletionAssistantMessageParam{}
+			var toolResults []openai.ChatCompletionMessageParamUnion
 
 			for _, part := range message.Parts {
 				switch part.Type {
@@ -113,11 +114,6 @@ func MessagesToOpenAI(messages []Message) ([]openai.ChatCompletionMessageParamUn
 						continue
 					}
 
-					openaiMessages = append(openaiMessages, openai.ChatCompletionMessageParamUnion{
-						OfAssistant: content,
-					})
-					content = &openai.ChatCompletionAssistantMessageParam{}
-
 					parts := []openai.ChatCompletionContentPartTextParam{}
 
 					var resultParts []Part
@@ -145,7 +141,7 @@ func MessagesToOpenAI(messages []Message) ([]openai.ChatCompletionMessageParamUn
 						}
 					}
 
-					openaiMessages = append(openaiMessages, openai.ChatCompletionMessageParamUnion{
+					toolResults = append(toolResults, openai.ChatCompletionMessageParamUnion{
 						OfTool: &openai.ChatCompletionToolMessageParam{
 							ToolCallID: part.ToolCallID,
 							Content: openai.ChatCompletionToolMessageParamContentUnion{
@@ -161,6 +157,7 @@ func MessagesToOpenAI(messages []Message) ([]openai.ChatCompletionMessageParamUn
 					OfAssistant: content,
 				})
 			}
+			openaiMessages = append(openaiMessages, toolResults...)
 		}
 	}
 
