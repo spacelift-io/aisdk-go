@@ -257,6 +257,7 @@ func GoogleToDataStream(stream iter.Seq2[*genai.GenerateContentResponse, error])
 		var currentContentBlockID int
 		currentContentBlockIDText := "0"
 		currentContentBlockType := ""
+		var thoughtSignature []byte // Persists across chunks for parallel function calls
 		bumpContentBlockID := func() {
 			currentContentBlockID++
 			currentContentBlockIDText = fmt.Sprintf("%d", currentContentBlockID)
@@ -338,12 +339,14 @@ func GoogleToDataStream(stream iter.Seq2[*genai.GenerateContentResponse, error])
 						}
 					}
 
-					// Build provider metadata if thought signature is present
-					var providerMetadata ProviderMetadata
+					// Capture thought signature - Google only sends it on the first parallel function call
 					if len(part.ThoughtSignature) > 0 {
-						providerMetadata.Google = &GoogleProviderMetadata{
-							ThoughtSignature: part.ThoughtSignature,
-						}
+						thoughtSignature = part.ThoughtSignature
+					}
+
+					var providerMetadata ProviderMetadata
+					if len(thoughtSignature) > 0 {
+						providerMetadata.Google = &GoogleProviderMetadata{ThoughtSignature: thoughtSignature}
 					}
 
 					if !yield(ToolInputAvailablePart{
