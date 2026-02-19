@@ -113,16 +113,29 @@ func ToolsToGoogle(tools []Tool) ([]*genai.Tool, error) {
 	}}, nil
 }
 
-// MessagesToGoogle converts internal message format to Google's genai.Content slice.
-// System messages are ignored.
-func MessagesToGoogle(messages []Message) ([]*genai.Content, error) {
+// MessagesToGoogle converts internal message format to Google's genai.Content slice
+// and extracts system messages into a separate SystemInstruction content.
+func MessagesToGoogle(messages []Message) ([]*genai.Content, *genai.Content, error) {
 	googleContents := []*genai.Content{}
+	systemInstructionParts := []string{}
 
 	for _, message := range messages {
 		switch message.Role {
 		case "system":
-			// System messages are ignored for Google's main message history.
-			// They are handled separately via SystemInstruction.
+			extracted := false
+			for _, part := range message.Parts {
+				if part.Type != PartTypeText {
+					continue
+				}
+				if strings.TrimSpace(part.Text) == "" {
+					continue
+				}
+				systemInstructionParts = append(systemInstructionParts, part.Text)
+				extracted = true
+			}
+			if !extracted && strings.TrimSpace(message.Content) != "" {
+				systemInstructionParts = append(systemInstructionParts, message.Content)
+			}
 
 		case "user":
 			content := &genai.Content{
@@ -143,11 +156,11 @@ func MessagesToGoogle(messages []Message) ([]*genai.Content, error) {
 			for _, attachment := range message.Attachments {
 				parts := strings.SplitN(attachment.URL, ",", 2)
 				if len(parts) != 2 {
-					return nil, fmt.Errorf("invalid attachment URL: %s", attachment.URL)
+					return nil, nil, fmt.Errorf("invalid attachment URL: %s", attachment.URL)
 				}
 				decoded, err := base64.StdEncoding.DecodeString(parts[1])
 				if err != nil {
-					return nil, fmt.Errorf("failed to decode attachment: %w", err)
+					return nil, nil, fmt.Errorf("failed to decode attachment: %w", err)
 				}
 				content.Parts = append(content.Parts, &genai.Part{InlineData: &genai.Blob{
 					Data:     decoded,
@@ -169,7 +182,7 @@ func MessagesToGoogle(messages []Message) ([]*genai.Content, error) {
 				case PartTypeToolInvocation:
 					argsMap, ok := part.Input.(map[string]any)
 					if !ok && part.Input != nil { // Allow nil args
-						return nil, fmt.Errorf("tool call args for %s are not map[string]any: %T", part.ToolName, part.Input)
+						return nil, nil, fmt.Errorf("tool call args for %s are not map[string]any: %T", part.ToolName, part.Input)
 					}
 					fc := genai.FunctionCall{
 						ID:   part.ToolCallID,
@@ -206,7 +219,7 @@ func MessagesToGoogle(messages []Message) ([]*genai.Content, error) {
 						var err error
 						parts, err = toolResultToParts(part.Output)
 						if err != nil {
-							return nil, fmt.Errorf("failed to convert tool call result to parts: %w", err)
+							return nil, nil, fmt.Errorf("failed to convert tool call result to parts: %w", err)
 						}
 					}
 					for _, part := range parts {
@@ -236,11 +249,21 @@ func MessagesToGoogle(messages []Message) ([]*genai.Content, error) {
 
 			googleContents = append(googleContents, content)
 		default:
-			return nil, fmt.Errorf("unsupported message role encountered: %s", message.Role)
+			return nil, nil, fmt.Errorf("unsupported message role encountered: %s", message.Role)
 		}
 	}
 
-	return googleContents, nil
+	var systemInstruction *genai.Content
+	if len(systemInstructionParts) > 0 {
+		systemInstruction = &genai.Content{
+			Role: "user",
+			Parts: []*genai.Part{
+				{Text: strings.Join(systemInstructionParts, "\n\n")},
+			},
+		}
+	}
+
+	return googleContents, systemInstruction, nil
 }
 
 // GoogleToDataStream pipes a Google AI stream to a DataStream.
