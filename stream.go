@@ -1,6 +1,7 @@
 package aisdk
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,6 +20,55 @@ type Chat struct {
 // DataStream is a stream of DataStreamParts.
 type DataStream iter.Seq2[DataStreamPart, error]
 
+// StreamTransformer transforms stream parts as they flow through.
+// It can modify or replace parts before they reach the consumer.
+type StreamTransformer func(DataStreamPart) DataStreamPart
+
+// StreamProcessor observes stream parts as they flow through.
+// Processors cannot modify parts, only observe them.
+type StreamProcessor func(DataStreamPart)
+
+// WithTransformers wraps the DataStream to transform parts before they reach the consumer.
+func (s DataStream) WithTransformers(transformers ...StreamTransformer) DataStream {
+	return func(yield func(DataStreamPart, error) bool) {
+		s(func(part DataStreamPart, err error) bool {
+			if err == nil && part != nil {
+				for _, t := range transformers {
+					part = t(part)
+				}
+			}
+			return yield(part, err)
+		})
+	}
+}
+
+// WithProcessors wraps the DataStream to call processors for each part.
+// Processors observe parts but cannot modify them.
+func (s DataStream) WithProcessors(processors ...StreamProcessor) DataStream {
+	return func(yield func(DataStreamPart, error) bool) {
+		s(func(part DataStreamPart, err error) bool {
+			if err == nil && part != nil {
+				for _, p := range processors {
+					p(part)
+				}
+			}
+			return yield(part, err)
+		})
+	}
+}
+
+// ReplyToMessageID returns a transformer that sets the message ID on MessageStartPart.
+// Use this when continuing/updating an existing message so useChat updates it in place.
+func ReplyToMessageID(messageID string) StreamTransformer {
+	return func(part DataStreamPart) DataStreamPart {
+		if p, ok := part.(MessageStartPart); ok {
+			p.MessageID = messageID
+			return p
+		}
+		return part
+	}
+}
+
 func SendSingleDataStreamPart(w io.Writer, part DataStreamPart) error {
 	messageJson, err := formatJSONPart(part)
 	if err != nil {
@@ -29,6 +79,11 @@ func SendSingleDataStreamPart(w io.Writer, part DataStreamPart) error {
 		return fmt.Errorf("failed to write part to writer: %w", err)
 	}
 	return nil
+}
+
+func WriteDone(w io.Writer) error {
+	_, err := fmt.Fprint(w, "[DONE]\n\n")
+	return err
 }
 
 // Pipe iterates over the DataStream and writes the parts to the writer.
@@ -399,6 +454,88 @@ func (p *Part) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+func (p Part) MarshalJSON() ([]byte, error) {
+	switch p.Type {
+	case PartTypeText:
+		data := map[string]any{"type": "text", "text": p.Text}
+		if p.State != "" {
+			data["state"] = string(p.State)
+		}
+		if p.ProviderMetadata != nil {
+			data["providerMetadata"] = p.ProviderMetadata
+		}
+		return json.Marshal(data)
+
+	case PartTypeReasoning:
+		data := map[string]any{"type": "reasoning", "text": p.Reasoning}
+		if p.State != "" {
+			data["state"] = string(p.State)
+		}
+		if len(p.Details) > 0 {
+			data["details"] = p.Details
+		}
+		if p.ProviderMetadata != nil {
+			data["providerMetadata"] = p.ProviderMetadata
+		}
+		return json.Marshal(data)
+
+	case PartTypeToolInvocation:
+		data := map[string]any{
+			"type":       "tool-" + p.ToolName,
+			"toolCallId": p.ToolCallID,
+		}
+		if p.State != "" {
+			data["state"] = string(p.State)
+		}
+		if p.Input != nil {
+			data["input"] = p.Input
+		}
+		if p.Output != nil {
+			data["output"] = p.Output
+		}
+		if p.ErrorText != "" {
+			data["errorText"] = p.ErrorText
+		}
+		if p.ProviderMetadata != nil {
+			data["callProviderMetadata"] = p.ProviderMetadata
+		}
+		return json.Marshal(data)
+
+	case PartTypeFile:
+		data := map[string]any{
+			"type":      "file",
+			"mediaType": p.MimeType,
+		}
+		if len(p.Data) > 0 {
+			data["url"] = "data:" + p.MimeType + ";base64," + base64.StdEncoding.EncodeToString(p.Data)
+		}
+		if p.ProviderMetadata != nil {
+			data["providerMetadata"] = p.ProviderMetadata
+		}
+		return json.Marshal(data)
+
+	case PartTypeStepStart:
+		return json.Marshal(map[string]string{"type": "step-start"})
+
+	case PartTypeSource:
+		data := map[string]any{"type": "source"}
+		if p.Source != nil {
+			data["source"] = p.Source
+		}
+		if p.ProviderMetadata != nil {
+			data["providerMetadata"] = p.ProviderMetadata
+		}
+		return json.Marshal(data)
+
+	default:
+		type alias Part
+		return json.Marshal(struct {
+			alias
+			Type string `json:"type"`
+		}{alias: alias(p), Type: string(p.Type)})
+	}
+}
+
 type Tool struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
@@ -413,6 +550,17 @@ type Schema struct {
 type ToolInvocationState string
 
 const (
+	// useChat tool states
+	ToolStateInputStreaming  ToolInvocationState = "input-streaming"
+	ToolStateInputAvailable  ToolInvocationState = "input-available"
+	ToolStateOutputAvailable ToolInvocationState = "output-available"
+	ToolStateOutputError     ToolInvocationState = "output-error"
+
+	// Text/reasoning states (same type, different values)
+	StateStreaming ToolInvocationState = "streaming"
+	StateDone      ToolInvocationState = "done"
+
+	// Legacy states for backward compatibility
 	ToolInvocationStateCall            ToolInvocationState = "call"
 	ToolInvocationStatePartialCall     ToolInvocationState = "partial-call"
 	ToolInvocationStateResult          ToolInvocationState = "result"
@@ -440,4 +588,185 @@ func toolResultToParts(result any) ([]Part, error) {
 		}
 		return []Part{{Type: PartTypeText, Text: string(jsonData)}}, nil
 	}
+}
+
+// MessageCollector accumulates stream parts into a Message compatible with useChat round-trip.
+type MessageCollector struct {
+	message              Message
+	activeTextParts      map[string]*partAccumulator
+	activeReasoningParts map[string]*partAccumulator
+	activeToolParts      map[string]int // toolCallId -> index in Parts
+}
+
+type partAccumulator struct {
+	index  int
+	buffer strings.Builder
+}
+
+// NewMessageCollector creates a new MessageCollector for accumulating stream parts.
+func NewMessageCollector() *MessageCollector {
+	return &MessageCollector{
+		message:              Message{Role: "assistant"},
+		activeTextParts:      make(map[string]*partAccumulator),
+		activeReasoningParts: make(map[string]*partAccumulator),
+		activeToolParts:      make(map[string]int),
+	}
+}
+
+// Process implements StreamProcessor to accumulate parts into a Message.
+func (c *MessageCollector) Process(part DataStreamPart) {
+	switch p := part.(type) {
+	case MessageStartPart:
+		c.message.ID = p.MessageID
+
+	// --- Text ---
+	case TextStartPart:
+		idx := len(c.message.Parts)
+		c.message.Parts = append(c.message.Parts, Part{
+			Type:  PartTypeText,
+			State: StateStreaming,
+		})
+		c.activeTextParts[p.ID] = &partAccumulator{index: idx}
+
+	case TextDeltaPart:
+		if acc, ok := c.activeTextParts[p.ID]; ok {
+			acc.buffer.WriteString(p.Delta)
+			c.message.Parts[acc.index].Text = acc.buffer.String()
+		}
+
+	case TextEndPart:
+		if acc, ok := c.activeTextParts[p.ID]; ok {
+			c.message.Parts[acc.index].Text = acc.buffer.String()
+			c.message.Parts[acc.index].State = StateDone
+			delete(c.activeTextParts, p.ID)
+		}
+
+	// --- Reasoning ---
+	case ReasoningStartPart:
+		idx := len(c.message.Parts)
+		c.message.Parts = append(c.message.Parts, Part{
+			Type:  PartTypeReasoning,
+			State: StateStreaming,
+		})
+		c.activeReasoningParts[p.ID] = &partAccumulator{index: idx}
+
+	case ReasoningDeltaPart:
+		if acc, ok := c.activeReasoningParts[p.ID]; ok {
+			acc.buffer.WriteString(p.Delta)
+			c.message.Parts[acc.index].Reasoning = acc.buffer.String()
+			if p.ProviderMetadata.Anthropic != nil {
+				c.message.Parts[acc.index].ProviderMetadata = &p.ProviderMetadata
+			}
+		}
+
+	case ReasoningEndPart:
+		if acc, ok := c.activeReasoningParts[p.ID]; ok {
+			c.message.Parts[acc.index].Reasoning = acc.buffer.String()
+			c.message.Parts[acc.index].State = StateDone
+			delete(c.activeReasoningParts, p.ID)
+		}
+
+	// --- Tools ---
+	case ToolInputStartPart:
+		idx := len(c.message.Parts)
+		c.message.Parts = append(c.message.Parts, Part{
+			Type:       PartTypeToolInvocation,
+			ToolCallID: p.ToolCallID,
+			ToolName:   p.ToolName,
+			State:      ToolStateInputStreaming,
+		})
+		c.activeToolParts[p.ToolCallID] = idx
+
+	case ToolInputAvailablePart:
+		idx, ok := c.activeToolParts[p.ToolCallID]
+		if !ok {
+			idx = len(c.message.Parts)
+			c.message.Parts = append(c.message.Parts, Part{
+				Type:       PartTypeToolInvocation,
+				ToolCallID: p.ToolCallID,
+				ToolName:   p.ToolName,
+			})
+			c.activeToolParts[p.ToolCallID] = idx
+		}
+		c.message.Parts[idx].Input = p.Input
+		c.message.Parts[idx].State = ToolStateInputAvailable
+		if p.ProviderMetadata.Anthropic != nil || p.ProviderMetadata.Google != nil {
+			c.message.Parts[idx].ProviderMetadata = &p.ProviderMetadata
+		}
+
+	case ToolOutputAvailablePart:
+		if idx, ok := c.activeToolParts[p.ToolCallID]; ok {
+			c.message.Parts[idx].Output = p.Output
+			c.message.Parts[idx].State = ToolStateOutputAvailable
+		}
+
+	// --- Steps ---
+	case FinishStepPart:
+		c.activeTextParts = make(map[string]*partAccumulator)
+		c.activeReasoningParts = make(map[string]*partAccumulator)
+	}
+}
+
+// Message returns the accumulated Message.
+func (c *MessageCollector) Message() Message {
+	return c.message
+}
+
+// MergeParts merges incoming parts with existing parts.
+// Tool invocation parts are merged by ToolCallID (updating existing ones).
+// Step-start parts are filtered out. Other parts are deduplicated by content.
+func MergeParts(existing, incoming []Part) []Part {
+	result := make([]Part, 0, len(existing)+len(incoming))
+	toolPartIdx := make(map[string]int)
+
+	for _, p := range existing {
+		if p.Type == PartTypeStepStart {
+			continue
+		}
+		if p.Type == PartTypeToolInvocation && p.ToolCallID != "" {
+			toolPartIdx[p.ToolCallID] = len(result)
+		}
+		result = append(result, p)
+	}
+
+	for _, p := range incoming {
+		if p.Type == PartTypeStepStart {
+			continue
+		}
+
+		if p.Type == PartTypeToolInvocation && p.ToolCallID != "" {
+			if idx, ok := toolPartIdx[p.ToolCallID]; ok {
+				result[idx] = p
+				continue
+			}
+			toolPartIdx[p.ToolCallID] = len(result)
+			result = append(result, p)
+			continue
+		}
+
+		if !containsSimilarPart(result, p) {
+			result = append(result, p)
+		}
+	}
+
+	return result
+}
+
+func containsSimilarPart(parts []Part, p Part) bool {
+	for _, existing := range parts {
+		if existing.Type != p.Type {
+			continue
+		}
+		switch p.Type {
+		case PartTypeText:
+			if existing.Text == p.Text {
+				return true
+			}
+		case PartTypeReasoning:
+			if existing.Reasoning == p.Reasoning {
+				return true
+			}
+		}
+	}
+	return false
 }
