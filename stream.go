@@ -255,6 +255,7 @@ type ToolCallResult interface {
 type ToolInputStartPart struct {
 	ToolCallID string `json:"toolCallId"`
 	ToolName   string `json:"toolName"`
+	Title      string `json:"title,omitempty"`
 }
 
 func (p ToolInputStartPart) Type() string { return "tool-input-start" }
@@ -271,6 +272,7 @@ func (p ToolInputDeltaPart) Type() string { return "tool-input-delta" }
 type ToolInputAvailablePart struct {
 	ToolCallID       string           `json:"toolCallId"`
 	ToolName         string           `json:"toolName"`
+	Title            string           `json:"title,omitempty"`
 	Input            map[string]any   `json:"input"`
 	ProviderMetadata ProviderMetadata `json:"providerMetadata,omitzero"`
 }
@@ -394,6 +396,7 @@ type Part struct {
 	// Type: "tool-invocation"
 	ToolCallID string              `json:"toolCallId"`
 	ToolName   string              `json:"toolName"`
+	Title      string              `json:"title,omitempty"`
 	Input      any                 `json:"input"`
 	Output     any                 `json:"output,omitempty"`
 	State      ToolInvocationState `json:"state,omitempty"`
@@ -484,6 +487,9 @@ func (p Part) MarshalJSON() ([]byte, error) {
 			"type":       "tool-" + p.ToolName,
 			"toolCallId": p.ToolCallID,
 		}
+		if p.Title != "" {
+			data["title"] = p.Title
+		}
 		if p.State != "" {
 			data["state"] = string(p.State)
 		}
@@ -539,7 +545,44 @@ func (p Part) MarshalJSON() ([]byte, error) {
 type Tool struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
+	Title       string `json:"title,omitempty"`
 	Schema      Schema `json:"schema"`
+}
+
+// InjectToolTitlesFromTools returns a transformer that injects tool titles
+// into streamed tool input parts based on the provided tool definitions.
+//
+// It only sets title when the stream part does not already include one.
+func InjectToolTitlesFromTools(tools []Tool) StreamTransformer {
+	titlesByName := make(map[string]string, len(tools))
+	for _, tool := range tools {
+		if tool.Title == "" {
+			continue
+		}
+		// Last non-empty title wins for duplicate tool names.
+		titlesByName[tool.Name] = tool.Title
+	}
+
+	if len(titlesByName) == 0 {
+		return func(part DataStreamPart) DataStreamPart { return part }
+	}
+
+	return func(part DataStreamPart) DataStreamPart {
+		switch p := part.(type) {
+		case ToolInputStartPart:
+			if p.Title == "" {
+				p.Title = titlesByName[p.ToolName]
+			}
+			return p
+		case ToolInputAvailablePart:
+			if p.Title == "" {
+				p.Title = titlesByName[p.ToolName]
+			}
+			return p
+		default:
+			return part
+		}
+	}
 }
 
 type Schema struct {
@@ -673,6 +716,7 @@ func (c *MessageCollector) Process(part DataStreamPart) {
 			Type:       PartTypeToolInvocation,
 			ToolCallID: p.ToolCallID,
 			ToolName:   p.ToolName,
+			Title:      p.Title,
 			State:      ToolStateInputStreaming,
 		})
 		c.activeToolParts[p.ToolCallID] = idx
@@ -685,8 +729,12 @@ func (c *MessageCollector) Process(part DataStreamPart) {
 				Type:       PartTypeToolInvocation,
 				ToolCallID: p.ToolCallID,
 				ToolName:   p.ToolName,
+				Title:      p.Title,
 			})
 			c.activeToolParts[p.ToolCallID] = idx
+		}
+		if p.Title != "" {
+			c.message.Parts[idx].Title = p.Title
 		}
 		c.message.Parts[idx].Input = p.Input
 		c.message.Parts[idx].State = ToolStateInputAvailable
