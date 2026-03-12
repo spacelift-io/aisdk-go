@@ -4,6 +4,7 @@ go 1.24
 
 require (
 	github.com/anthropics/anthropic-sdk-go v1.17.0
+	github.com/aws/aws-sdk-go-v2/service/bedrockruntime v1.50.1
 	github.com/google/uuid v1.6.0
 	github.com/openai/openai-go v1.12.0
 	google.golang.org/genai v1.43.0
@@ -13,6 +14,11 @@ require (
 	cloud.google.com/go v0.116.0 // indirect
 	cloud.google.com/go/auth v0.9.3 // indirect
 	cloud.google.com/go/compute/metadata v0.5.0 // indirect
+	github.com/aws/aws-sdk-go-v2 v1.41.3 // indirect
+	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.6 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.19 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.19 // indirect
+	github.com/aws/smithy-go v1.24.2 // indirect
 	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
 	github.com/google/go-cmp v0.6.0 // indirect
 	github.com/google/s2a-go v0.1.8 // indirect

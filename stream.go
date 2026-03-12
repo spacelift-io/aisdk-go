@@ -418,6 +418,7 @@ type Part struct {
 type ProviderMetadata struct {
 	Anthropic *AnthropicProviderMetadata `json:"anthropic,omitzero"`
 	Google    *GoogleProviderMetadata    `json:"google,omitzero"`
+	Bedrock   *BedrockProviderMetadata   `json:"bedrock,omitzero"`
 }
 
 type AnthropicProviderMetadata struct {
@@ -429,8 +430,13 @@ type GoogleProviderMetadata struct {
 	ThoughtSignature []byte `json:"thoughtSignature,omitempty"` // Thought signature for function calls (Gemini 3+)
 }
 
+type BedrockProviderMetadata struct {
+	Signature    string `json:"signature,omitempty"`    // Signature for Bedrock reasoning replay
+	RedactedData string `json:"redactedData,omitempty"` // Base64-encoded redacted reasoning payload
+}
+
 func hasProviderMetadata(metadata ProviderMetadata) bool {
-	return metadata.Anthropic != nil || metadata.Google != nil
+	return metadata.Anthropic != nil || metadata.Google != nil || metadata.Bedrock != nil
 }
 
 func (p *Part) UnmarshalJSON(data []byte) error {
@@ -747,7 +753,7 @@ func (c *MessageCollector) Process(part DataStreamPart) {
 		}
 		c.message.Parts[idx].Input = p.Input
 		c.message.Parts[idx].State = ToolStateInputAvailable
-		if p.ProviderMetadata.Anthropic != nil || p.ProviderMetadata.Google != nil {
+		if hasProviderMetadata(p.ProviderMetadata) {
 			c.message.Parts[idx].ProviderMetadata = &p.ProviderMetadata
 		}
 
