@@ -164,8 +164,9 @@ func (p TextStartPart) Type() string { return "text-start" }
 
 // TextDeltaPart contains incremental text content.
 type TextDeltaPart struct {
-	ID    string `json:"id"`
-	Delta string `json:"delta"`
+	ID               string           `json:"id"`
+	Delta            string           `json:"delta"`
+	ProviderMetadata ProviderMetadata `json:"providerMetadata,omitzero"`
 }
 
 func (p TextDeltaPart) Type() string { return "text-delta" }
@@ -420,11 +421,16 @@ type ProviderMetadata struct {
 }
 
 type AnthropicProviderMetadata struct {
-	Signature string `json:"signature,omitempty"` // Optional signature for reasoning
+	Signature    string `json:"signature,omitempty"`    // Optional signature for reasoning
+	RedactedData string `json:"redactedData,omitempty"` // Encrypted payload of a redacted_thinking block, replayed verbatim
 }
 
 type GoogleProviderMetadata struct {
 	ThoughtSignature []byte `json:"thoughtSignature,omitempty"` // Thought signature for function calls (Gemini 3+)
+}
+
+func hasProviderMetadata(metadata ProviderMetadata) bool {
+	return metadata.Anthropic != nil || metadata.Google != nil
 }
 
 func (p *Part) UnmarshalJSON(data []byte) error {
@@ -675,6 +681,9 @@ func (c *MessageCollector) Process(part DataStreamPart) {
 		if acc, ok := c.activeTextParts[p.ID]; ok {
 			acc.buffer.WriteString(p.Delta)
 			c.message.Parts[acc.index].Text = acc.buffer.String()
+			if hasProviderMetadata(p.ProviderMetadata) {
+				c.message.Parts[acc.index].ProviderMetadata = &p.ProviderMetadata
+			}
 		}
 
 	case TextEndPart:
@@ -697,7 +706,7 @@ func (c *MessageCollector) Process(part DataStreamPart) {
 		if acc, ok := c.activeReasoningParts[p.ID]; ok {
 			acc.buffer.WriteString(p.Delta)
 			c.message.Parts[acc.index].Reasoning = acc.buffer.String()
-			if p.ProviderMetadata.Anthropic != nil {
+			if hasProviderMetadata(p.ProviderMetadata) {
 				c.message.Parts[acc.index].ProviderMetadata = &p.ProviderMetadata
 			}
 		}

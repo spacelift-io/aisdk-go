@@ -74,6 +74,14 @@ func MessagesToAnthropic(messages []Message) ([]anthropic.MessageParam, []anthro
 			for _, part := range message.Parts {
 				switch part.Type {
 				case PartTypeReasoning:
+					if part.ProviderMetadata != nil && part.ProviderMetadata.Anthropic != nil && part.ProviderMetadata.Anthropic.RedactedData != "" {
+						content = append(content, anthropic.ContentBlockParamUnion{
+							OfRedactedThinking: &anthropic.RedactedThinkingBlockParam{
+								Data: part.ProviderMetadata.Anthropic.RedactedData,
+							},
+						})
+						continue
+					}
 					content = append(content, anthropic.ContentBlockParamUnion{
 						OfThinking: &anthropic.ThinkingBlockParam{
 							Thinking:  part.Text,
@@ -302,6 +310,25 @@ func AnthropicToDataStream(stream *ssestream.Stream[anthropic.MessageStreamEvent
 				case anthropic.ThinkingBlock:
 					if !yield(ReasoningStartPart{
 						ID: currentContentBlockIDText,
+					}, nil) {
+						return
+					}
+					currentContentBlockType = "thinking"
+				case anthropic.RedactedThinkingBlock:
+					// The encrypted payload arrives complete in content_block_start;
+					// there is no delta type for redacted thinking.
+					if !yield(ReasoningStartPart{
+						ID: currentContentBlockIDText,
+					}, nil) {
+						return
+					}
+					if !yield(ReasoningDeltaPart{
+						ID: currentContentBlockIDText,
+						ProviderMetadata: ProviderMetadata{
+							Anthropic: &AnthropicProviderMetadata{
+								RedactedData: block.Data,
+							},
+						},
 					}, nil) {
 						return
 					}

@@ -176,8 +176,27 @@ func MessagesToGoogle(messages []Message) ([]*genai.Content, *genai.Content, err
 			for _, part := range message.Parts {
 				switch part.Type {
 				case PartTypeText:
-					content.Parts = append(content.Parts, &genai.Part{
+					genaiPart := &genai.Part{
 						Text: part.Text,
+					}
+					if part.ProviderMetadata != nil && part.ProviderMetadata.Google != nil {
+						genaiPart.ThoughtSignature = part.ProviderMetadata.Google.ThoughtSignature
+					}
+					content.Parts = append(content.Parts, genaiPart)
+				case PartTypeReasoning:
+					// Unsigned thought summaries stay client-side, but Gemini 3 requires
+					// signed thought parts back on subsequent turns.
+					if part.ProviderMetadata == nil || part.ProviderMetadata.Google == nil || len(part.ProviderMetadata.Google.ThoughtSignature) == 0 {
+						continue
+					}
+					reasoningText := part.Reasoning
+					if reasoningText == "" {
+						reasoningText = part.Text
+					}
+					content.Parts = append(content.Parts, &genai.Part{
+						Text:             reasoningText,
+						Thought:          true,
+						ThoughtSignature: part.ProviderMetadata.Google.ThoughtSignature,
 					})
 				case PartTypeToolInvocation:
 					argsMap, ok := part.Input.(map[string]any)
@@ -385,7 +404,42 @@ func GoogleToDataStream(stream iter.Seq2[*genai.GenerateContentResponse, error])
 					continue
 				}
 
+				// Gemini 3 may attach thought signatures to any part type, and all
+				// of them must be echoed back on subsequent turns.
+				var partMetadata ProviderMetadata
+				if len(part.ThoughtSignature) > 0 {
+					partMetadata.Google = &GoogleProviderMetadata{ThoughtSignature: part.ThoughtSignature}
+				}
+
 				if part.Text == "" {
+					if partMetadata.Google == nil {
+						continue
+					}
+					// A signature can arrive on a part with no text; losing it would
+					// break signature validation on the next turn.
+					switch currentContentBlockType {
+					case "text":
+						if !yield(TextDeltaPart{ID: currentContentBlockIDText, ProviderMetadata: partMetadata}, nil) {
+							return
+						}
+					case "reasoning":
+						if !yield(ReasoningDeltaPart{ID: currentContentBlockIDText, ProviderMetadata: partMetadata}, nil) {
+							return
+						}
+					default:
+						// The wire shape for a standalone signature is an empty text
+						// part, so replay must produce a text part, not a thought part.
+						if !yield(TextStartPart{ID: currentContentBlockIDText}, nil) {
+							return
+						}
+						if !yield(TextDeltaPart{ID: currentContentBlockIDText, ProviderMetadata: partMetadata}, nil) {
+							return
+						}
+						if !yield(TextEndPart{ID: currentContentBlockIDText}, nil) {
+							return
+						}
+						bumpContentBlockID()
+					}
 					continue
 				}
 
@@ -404,8 +458,9 @@ func GoogleToDataStream(stream iter.Seq2[*genai.GenerateContentResponse, error])
 						currentContentBlockType = "reasoning"
 					}
 					if !yield(ReasoningDeltaPart{
-						ID:    currentContentBlockIDText,
-						Delta: text,
+						ID:               currentContentBlockIDText,
+						Delta:            text,
+						ProviderMetadata: partMetadata,
 					}, nil) {
 						return
 					}
@@ -423,8 +478,9 @@ func GoogleToDataStream(stream iter.Seq2[*genai.GenerateContentResponse, error])
 						currentContentBlockType = "text"
 					}
 					if !yield(TextDeltaPart{
-						ID:    currentContentBlockIDText,
-						Delta: text,
+						ID:               currentContentBlockIDText,
+						Delta:            text,
+						ProviderMetadata: partMetadata,
 					}, nil) {
 						return
 					}
