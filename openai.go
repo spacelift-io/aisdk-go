@@ -334,8 +334,25 @@ func OpenAIToDataStream(stream *ssestream.Stream[openai.ChatCompletionChunk]) (D
 				var input map[string]any
 				if state.Args != "" {
 					if err := json.Unmarshal([]byte(state.Args), &input); err != nil {
-						yield(nil, fmt.Errorf("unmarshalling tool input for call %s %q: %w", state.ID, state.Args, err))
-						return
+						// Mirror Vercel: malformed tool input (typically a length-
+						// truncated stream) never errors the stream. Emit the error
+						// parts and move on to the next accumulated tool call.
+						errorText := fmt.Sprintf("unmarshalling tool input for call %s: %s", state.ID, err)
+						if !yield(ToolInputErrorPart{
+							ToolCallID: state.ID,
+							ToolName:   state.Name,
+							Input:      state.Args,
+							ErrorText:  errorText,
+						}, nil) {
+							return
+						}
+						if !yield(ToolOutputErrorPart{
+							ToolCallID: state.ID,
+							ErrorText:  errorText,
+						}, nil) {
+							return
+						}
+						continue
 					}
 				}
 				if !yield(ToolInputAvailablePart{

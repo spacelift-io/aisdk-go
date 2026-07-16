@@ -280,6 +280,27 @@ type ToolInputAvailablePart struct {
 
 func (p ToolInputAvailablePart) Type() string { return "tool-input-available" }
 
+// ToolInputErrorPart indicates the accumulated tool input failed to parse.
+// Mirrors Vercel's tool-input-error chunk: the raw accumulated input string is
+// echoed back in Input and the tool is never executed.
+type ToolInputErrorPart struct {
+	ToolCallID string `json:"toolCallId"`
+	ToolName   string `json:"toolName"`
+	Title      string `json:"title,omitempty"`
+	Input      any    `json:"input"`
+	ErrorText  string `json:"errorText"`
+}
+
+func (p ToolInputErrorPart) Type() string { return "tool-input-error" }
+
+// ToolOutputErrorPart indicates the tool call ended in an error state.
+type ToolOutputErrorPart struct {
+	ToolCallID string `json:"toolCallId"`
+	ErrorText  string `json:"errorText"`
+}
+
+func (p ToolOutputErrorPart) Type() string { return "tool-output-error" }
+
 // ToolOutputAvailablePart provides tool output.
 type ToolOutputAvailablePart struct {
 	ToolCallID string `json:"toolCallId"`
@@ -591,6 +612,11 @@ func InjectToolTitlesFromTools(tools []Tool) StreamTransformer {
 				p.Title = titlesByName[p.ToolName]
 			}
 			return p
+		case ToolInputErrorPart:
+			if p.Title == "" {
+				p.Title = titlesByName[p.ToolName]
+			}
+			return p
 		default:
 			return part
 		}
@@ -761,6 +787,36 @@ func (c *MessageCollector) Process(part DataStreamPart) {
 		if idx, ok := c.activeToolParts[p.ToolCallID]; ok {
 			c.message.Parts[idx].Output = p.Output
 			c.message.Parts[idx].State = ToolStateOutputAvailable
+		}
+
+	case ToolInputErrorPart:
+		idx, ok := c.activeToolParts[p.ToolCallID]
+		if !ok {
+			idx = len(c.message.Parts)
+			c.message.Parts = append(c.message.Parts, Part{
+				Type:       PartTypeToolInvocation,
+				ToolCallID: p.ToolCallID,
+				ToolName:   p.ToolName,
+				Title:      p.Title,
+			})
+			c.activeToolParts[p.ToolCallID] = idx
+		}
+		if p.Title != "" {
+			c.message.Parts[idx].Title = p.Title
+		}
+		if c.message.Parts[idx].ToolName == "" {
+			c.message.Parts[idx].ToolName = p.ToolName
+		}
+		// Mirror the Vercel client: the raw unparseable input is not stored as
+		// the part input; nil round-trips to providers as an empty object.
+		c.message.Parts[idx].Input = nil
+		c.message.Parts[idx].State = ToolStateOutputError
+		c.message.Parts[idx].ErrorText = p.ErrorText
+
+	case ToolOutputErrorPart:
+		if idx, ok := c.activeToolParts[p.ToolCallID]; ok {
+			c.message.Parts[idx].State = ToolStateOutputError
+			c.message.Parts[idx].ErrorText = p.ErrorText
 		}
 
 	// --- Steps ---

@@ -372,14 +372,32 @@ func AnthropicToDataStream(stream *ssestream.Stream[anthropic.MessageStreamEvent
 					bumpContentBlockID()
 				case "tool_use":
 					var input map[string]any
+					var inputErr error
 					if currentToolCall.Args != "" {
-						if err := json.Unmarshal([]byte(currentToolCall.Args), &input); err != nil {
-							yield(nil, fmt.Errorf("unmarshalling tool input for call %s %q: %w", currentToolCall.ID, currentToolCall.Args, err))
-							return
-						}
+						inputErr = json.Unmarshal([]byte(currentToolCall.Args), &input)
 					}
 
-					if !yield(ToolInputAvailablePart{
+					if inputErr != nil {
+						// Mirror Vercel: malformed tool input (typically max_tokens
+						// truncation) never errors the stream. Emit the error parts
+						// and keep going; the finish reason arrives later in
+						// message_delta.
+						errorText := fmt.Sprintf("unmarshalling tool input for call %s: %s", currentToolCall.ID, inputErr)
+						if !yield(ToolInputErrorPart{
+							ToolCallID: currentToolCall.ID,
+							ToolName:   currentToolCall.Name,
+							Input:      currentToolCall.Args,
+							ErrorText:  errorText,
+						}, nil) {
+							return
+						}
+						if !yield(ToolOutputErrorPart{
+							ToolCallID: currentToolCall.ID,
+							ErrorText:  errorText,
+						}, nil) {
+							return
+						}
+					} else if !yield(ToolInputAvailablePart{
 						ToolCallID: currentToolCall.ID,
 						ToolName:   currentToolCall.Name,
 						Input:      input,
@@ -398,11 +416,14 @@ func AnthropicToDataStream(stream *ssestream.Stream[anthropic.MessageStreamEvent
 
 			case anthropic.MessageDeltaEvent:
 				usage.OutputTokens += event.Usage.OutputTokens
+				if event.Delta.StopReason != "" {
+					finalReason = mapAnthropicStopReason(event.Delta.StopReason)
+				}
 
 			case anthropic.MessageStopEvent:
-				// Determine final reason if not already set by tool_use
+				// Fall back to "stop" when the provider never reported a stop reason.
 				if finalReason == FinishReasonUnknown {
-					finalReason = FinishReasonStop // Default if not tool_use
+					finalReason = FinishReasonStop
 				}
 
 				// Send final finish step
@@ -411,7 +432,7 @@ func AnthropicToDataStream(stream *ssestream.Stream[anthropic.MessageStreamEvent
 				}
 
 				// Send final finish message
-				if !yield(FinishPart{}, nil) {
+				if !yield(FinishPart{FinishReason: finalReason}, nil) {
 					return
 				}
 			}
@@ -433,11 +454,35 @@ func AnthropicToDataStream(stream *ssestream.Stream[anthropic.MessageStreamEvent
 				return
 			}
 
-			if !yield(FinishPart{}, nil) {
+			// "unknown" is not part of the client's finish-reason enum, so omit
+			// the field entirely when the provider never reported a reason.
+			finishPart := FinishPart{}
+			if finalReason != FinishReasonUnknown {
+				finishPart.FinishReason = finalReason
+			}
+			if !yield(finishPart, nil) {
 				return
 			}
 		}
 	}
 
 	return dataStream, getUsage
+}
+
+// mapAnthropicStopReason mirrors the reference implementation's
+// map-anthropic-stop-reason.ts. The SDK has no constant for
+// model_context_window_exceeded, hence the raw string case.
+func mapAnthropicStopReason(stopReason anthropic.StopReason) FinishReason {
+	switch stopReason {
+	case anthropic.StopReasonPauseTurn, anthropic.StopReasonEndTurn, anthropic.StopReasonStopSequence:
+		return FinishReasonStop
+	case anthropic.StopReasonRefusal:
+		return FinishReasonContentFilter
+	case anthropic.StopReasonToolUse:
+		return FinishReasonToolCalls
+	case anthropic.StopReasonMaxTokens, "model_context_window_exceeded":
+		return FinishReasonLength
+	default:
+		return FinishReasonOther
+	}
 }
