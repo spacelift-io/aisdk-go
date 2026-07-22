@@ -1,6 +1,6 @@
 module github.com/spacelift-io/aisdk-go
 
-go 1.26.4
+go 1.26
 
 require (
 	github.com/anthropics/anthropic-sdk-go v1.57.0
