@@ -525,7 +525,9 @@ func GoogleToDataStream(stream iter.Seq2[*genai.GenerateContentResponse, error])
 			case genai.FinishReasonRecitation:
 				actualFinalReason = FinishReasonContentFilter // Treat recitation as content filter
 			case genai.FinishReasonUnspecified:
-				actualFinalReason = FinishReasonUnknown
+				// "unknown" is not part of the client's finish-reason enum;
+				// map to "other" so strict clients accept the finish part.
+				actualFinalReason = FinishReasonOther
 			default:
 				actualFinalReason = FinishReasonOther
 			}
