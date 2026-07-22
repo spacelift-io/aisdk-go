@@ -220,7 +220,8 @@ func MessagesToGoogle(messages []Message) ([]*genai.Content, *genai.Content, err
 
 					content.Parts = append(content.Parts, genaiPart)
 
-					if part.State != ToolInvocationStateOutputAvailable && part.State != ToolInvocationStateOutputError {
+					denied := isDeniedToolPart(part)
+					if part.State != ToolStateOutputAvailable && part.State != ToolStateOutputError && !denied {
 						continue
 					}
 
@@ -232,7 +233,9 @@ func MessagesToGoogle(messages []Message) ([]*genai.Content, *genai.Content, err
 					googleParts := []*genai.Part{}
 
 					var parts []Part
-					if part.State == ToolInvocationStateOutputError {
+					if denied {
+						parts = []Part{{Type: PartTypeText, Text: deniedToolResultReason(part)}}
+					} else if part.State == ToolStateOutputError {
 						parts = []Part{{Type: PartTypeText, Text: part.ErrorText}}
 					} else {
 						var err error

@@ -78,6 +78,107 @@ func (s DataStream) WithProcessors(processors ...StreamProcessor) DataStream {
 	}
 }
 
+// InjectToolApprovalRequests returns a transformer that emits a
+// tool-approval-request part after each tool-input-available part whose tool
+// requires user approval. Providers know nothing about approvals, so the
+// request has to be fabricated between the provider stream and the client.
+func InjectToolApprovalRequests(needsApproval func(toolName string, input map[string]any) bool, newApprovalID func() string) StreamTransformer {
+	return func(part DataStreamPart) []DataStreamPart {
+		p, ok := part.(ToolInputAvailablePart)
+		if !ok || !needsApproval(p.ToolName, p.Input) {
+			return nil
+		}
+		return []DataStreamPart{
+			p,
+			ToolApprovalRequestPart{
+				ApprovalID: newApprovalID(),
+				ToolCallID: p.ToolCallID,
+			},
+		}
+	}
+}
+
+// MarkDeniedToolCalls processes tool call denials that arrived from the
+// client.
+//
+// When the user denies a tool call, useChat records the decision on the tool
+// part (state approval-responded with approval.approved false) and resends
+// the message. That state means answered but not yet processed: the part has
+// no output, and the client keeps it non-terminal until the server
+// acknowledges the denial with a tool-output-denied stream part.
+//
+// This function finds such parts, moves them to their terminal output-denied
+// state, and returns their tool call IDs so the caller can emit the
+// acknowledgment on the outgoing stream with [InjectToolOutputsDenied].
+//
+// Call it on incoming messages before persisting them and before building
+// provider prompts. Persisting the flipped state makes reloads serve the same
+// terminal state the live stream produced, and the flip doubles as the
+// exactly-once guard: a retried request finds output-denied instead of
+// approval-responded and returns nothing.
+func MarkDeniedToolCalls(messages []Message) []string {
+	var toolCallIDs []string
+	for mi := range messages {
+		if messages[mi].Role != "assistant" {
+			continue
+		}
+		for pi := range messages[mi].Parts {
+			part := &messages[mi].Parts[pi]
+			if part.Type != PartTypeToolInvocation ||
+				part.State != ToolStateApprovalResponded ||
+				part.Approval == nil ||
+				part.Approval.Approved == nil ||
+				*part.Approval.Approved {
+				continue
+			}
+			part.State = ToolStateOutputDenied
+			toolCallIDs = append(toolCallIDs, part.ToolCallID)
+		}
+	}
+	return toolCallIDs
+}
+
+// InjectToolOutputsDenied returns a transformer that emits a
+// tool-output-denied part per tool call ID right after the message start, so
+// the client moves the denied tool parts of the replied-to message into their
+// terminal state before new content arrives. Pair it with
+// [MarkDeniedToolCalls] on the incoming messages.
+func InjectToolOutputsDenied(toolCallIDs ...string) StreamTransformer {
+	injected := false
+	return func(part DataStreamPart) []DataStreamPart {
+		if injected || len(toolCallIDs) == 0 {
+			return nil
+		}
+		p, ok := part.(MessageStartPart)
+		if !ok {
+			return nil
+		}
+		injected = true
+		parts := make([]DataStreamPart, 0, len(toolCallIDs)+1)
+		parts = append(parts, p)
+		for _, toolCallID := range toolCallIDs {
+			parts = append(parts, ToolOutputDeniedPart{ToolCallID: toolCallID})
+		}
+		return parts
+	}
+}
+
+// NeedsApprovalFromTools returns a predicate for [InjectToolApprovalRequests]
+// based on the NeedsApproval flag of the provided tool definitions. The input
+// argument is ignored; it exists so callers can substitute input-dependent
+// policies without changing the transformer.
+func NeedsApprovalFromTools(tools []Tool) func(toolName string, input map[string]any) bool {
+	names := make(map[string]bool, len(tools))
+	for _, tool := range tools {
+		if tool.NeedsApproval {
+			names[tool.Name] = true
+		}
+	}
+	return func(toolName string, _ map[string]any) bool {
+		return names[toolName]
+	}
+}
+
 // ReplyToMessageID returns a transformer that sets the message ID on MessageStartPart.
 // Use this when continuing/updating an existing message so useChat updates it in place.
 func ReplyToMessageID(messageID string) StreamTransformer {
@@ -309,6 +410,39 @@ type ToolOutputAvailablePart struct {
 
 func (p ToolOutputAvailablePart) Type() string { return "tool-output-available" }
 
+// ToolApprovalRequestPart asks the client for permission to run a tool call.
+// IsAutomatic and Signature exist in the v7 protocol only; ai@6 clients
+// validate stream parts strictly, so leave them unset until the frontend
+// upgrades.
+type ToolApprovalRequestPart struct {
+	ApprovalID  string `json:"approvalId"`
+	ToolCallID  string `json:"toolCallId"`
+	IsAutomatic bool   `json:"isAutomatic,omitempty"`
+	Signature   string `json:"signature,omitempty"`
+}
+
+func (p ToolApprovalRequestPart) Type() string { return "tool-approval-request" }
+
+// ToolApprovalResponsePart records an approval decision on the stream. The
+// v6 protocol has no such part (decisions travel back inside message parts);
+// it is only ever streamed for server-decided automatic approvals on v7+.
+type ToolApprovalResponsePart struct {
+	ApprovalID       string `json:"approvalId"`
+	Approved         bool   `json:"approved"`
+	Reason           string `json:"reason,omitempty"`
+	ProviderExecuted bool   `json:"providerExecuted,omitempty"`
+}
+
+func (p ToolApprovalResponsePart) Type() string { return "tool-approval-response" }
+
+// ToolOutputDeniedPart moves a denied tool call to its terminal state on the
+// client after the server has processed the denial.
+type ToolOutputDeniedPart struct {
+	ToolCallID string `json:"toolCallId"`
+}
+
+func (p ToolOutputDeniedPart) Type() string { return "tool-output-denied" }
+
 // StartStepStreamPart corresponds to TYPE_ID 'f'.
 type StartStepStreamPart struct {
 }
@@ -423,6 +557,7 @@ type Part struct {
 	Output     any                 `json:"output,omitempty"`
 	State      ToolInvocationState `json:"state,omitempty"`
 	ErrorText  string              `json:"errorText,omitempty"`
+	Approval   *ToolApproval       `json:"approval,omitempty"`
 
 	// Type: "source"
 	Source *SourceInfo `json:"source,omitempty"`
@@ -434,6 +569,18 @@ type Part struct {
 	// Type: "step-start" - No additional fields
 
 	ProviderMetadata *ProviderMetadata `json:"providerMetadata,omitzero"`
+}
+
+// ToolApproval carries the approval lifecycle of a tool-invocation part, as
+// exchanged with useChat inside message parts. Approved stays nil while the
+// request awaits a decision. Signature is passed through verbatim; this
+// library performs no verification.
+type ToolApproval struct {
+	ID          string `json:"id"`
+	Approved    *bool  `json:"approved,omitempty"`
+	Reason      string `json:"reason,omitempty"`
+	IsAutomatic bool   `json:"isAutomatic,omitempty"`
+	Signature   string `json:"signature,omitempty"`
 }
 
 type ProviderMetadata struct {
@@ -535,6 +682,9 @@ func (p Part) MarshalJSON() ([]byte, error) {
 		if p.ErrorText != "" {
 			data["errorText"] = p.ErrorText
 		}
+		if p.Approval != nil {
+			data["approval"] = p.Approval
+		}
 		if p.ProviderMetadata != nil {
 			data["callProviderMetadata"] = p.ProviderMetadata
 		}
@@ -576,10 +726,11 @@ func (p Part) MarshalJSON() ([]byte, error) {
 }
 
 type Tool struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Title       string `json:"title,omitempty"`
-	Schema      Schema `json:"schema"`
+	Name          string `json:"name"`
+	Description   string `json:"description"`
+	Title         string `json:"title,omitempty"`
+	NeedsApproval bool   `json:"needsApproval,omitempty"`
+	Schema        Schema `json:"schema"`
 }
 
 // InjectToolTitlesFromTools returns a transformer that injects tool titles
@@ -627,10 +778,13 @@ type ToolInvocationState string
 
 const (
 	// useChat tool states
-	ToolStateInputStreaming  ToolInvocationState = "input-streaming"
-	ToolStateInputAvailable  ToolInvocationState = "input-available"
-	ToolStateOutputAvailable ToolInvocationState = "output-available"
-	ToolStateOutputError     ToolInvocationState = "output-error"
+	ToolStateInputStreaming    ToolInvocationState = "input-streaming"
+	ToolStateInputAvailable    ToolInvocationState = "input-available"
+	ToolStateApprovalRequested ToolInvocationState = "approval-requested"
+	ToolStateApprovalResponded ToolInvocationState = "approval-responded"
+	ToolStateOutputAvailable   ToolInvocationState = "output-available"
+	ToolStateOutputError       ToolInvocationState = "output-error"
+	ToolStateOutputDenied      ToolInvocationState = "output-denied"
 
 	// Text/reasoning states (same type, different values)
 	StateStreaming ToolInvocationState = "streaming"
@@ -649,6 +803,31 @@ func WriteDataStreamHeaders(w http.ResponseWriter) {
 	w.Header().Set("X-Vercel-AI-Data-Stream", "v2")
 	w.Header().Set("X-Accel-Buffering", "no") // Disable buffering for real-time streaming
 	w.WriteHeader(http.StatusOK)
+}
+
+// deniedToolResultText matches the wording the Vercel AI SDK uses when a
+// denied tool call is surfaced to the model as a tool result.
+const deniedToolResultText = "Tool call execution denied."
+
+// isDeniedToolPart reports whether the tool-invocation part represents a
+// denied tool call: either already in its terminal output-denied state, or
+// carrying a negative approval decision that has not been processed yet.
+func isDeniedToolPart(p Part) bool {
+	if p.Type != PartTypeToolInvocation {
+		return false
+	}
+	if p.State == ToolStateOutputDenied {
+		return true
+	}
+	return p.State == ToolStateApprovalResponded && p.Approval != nil &&
+		p.Approval.Approved != nil && !*p.Approval.Approved
+}
+
+func deniedToolResultReason(p Part) string {
+	if p.Approval != nil && p.Approval.Reason != "" {
+		return p.Approval.Reason
+	}
+	return deniedToolResultText
 }
 
 func toolResultToParts(result any) ([]Part, error) {
@@ -671,7 +850,8 @@ type MessageCollector struct {
 	message              Message
 	activeTextParts      map[string]*partAccumulator
 	activeReasoningParts map[string]*partAccumulator
-	activeToolParts      map[string]int // toolCallId -> index in Parts
+	activeToolParts      map[string]int    // toolCallId -> index in Parts
+	approvalToToolCall   map[string]string // approvalId -> toolCallId
 }
 
 type partAccumulator struct {
@@ -686,6 +866,7 @@ func NewMessageCollector() *MessageCollector {
 		activeTextParts:      make(map[string]*partAccumulator),
 		activeReasoningParts: make(map[string]*partAccumulator),
 		activeToolParts:      make(map[string]int),
+		approvalToToolCall:   make(map[string]string),
 	}
 }
 
@@ -782,6 +963,39 @@ func (c *MessageCollector) Process(part DataStreamPart) {
 		if idx, ok := c.activeToolParts[p.ToolCallID]; ok {
 			c.message.Parts[idx].Output = p.Output
 			c.message.Parts[idx].State = ToolStateOutputAvailable
+		}
+
+	case ToolApprovalRequestPart:
+		if idx, ok := c.activeToolParts[p.ToolCallID]; ok {
+			c.message.Parts[idx].State = ToolStateApprovalRequested
+			c.message.Parts[idx].Approval = &ToolApproval{
+				ID:          p.ApprovalID,
+				IsAutomatic: p.IsAutomatic,
+				Signature:   p.Signature,
+			}
+			c.approvalToToolCall[p.ApprovalID] = p.ToolCallID
+		}
+
+	case ToolApprovalResponsePart:
+		toolCallID, ok := c.approvalToToolCall[p.ApprovalID]
+		if !ok {
+			break
+		}
+		if idx, ok := c.activeToolParts[toolCallID]; ok {
+			approved := p.Approved
+			approval := c.message.Parts[idx].Approval
+			if approval == nil {
+				approval = &ToolApproval{ID: p.ApprovalID}
+				c.message.Parts[idx].Approval = approval
+			}
+			approval.Approved = &approved
+			approval.Reason = p.Reason
+			c.message.Parts[idx].State = ToolStateApprovalResponded
+		}
+
+	case ToolOutputDeniedPart:
+		if idx, ok := c.activeToolParts[p.ToolCallID]; ok {
+			c.message.Parts[idx].State = ToolStateOutputDenied
 		}
 
 	// --- Steps ---
