@@ -480,7 +480,9 @@ func AnthropicToDataStream(stream *ssestream.Stream[anthropic.MessageStreamEvent
 }
 
 // mapAnthropicStopReason mirrors the reference implementation's
-// map-anthropic-stop-reason.ts. The SDK has no constant for
+// map-anthropic-stop-reason.ts, except the default maps to "other" instead of
+// "unknown": the client's finish-reason enum has no "unknown", so strict
+// clients would reject the finish part. The SDK has no constant for
 // model_context_window_exceeded, hence the raw string case.
 func mapAnthropicStopReason(stopReason anthropic.StopReason) FinishReason {
 	switch stopReason {
