@@ -497,7 +497,8 @@ func MessagesToBedrock(messages []Message) ([]bedrocktypes.Message, []bedrocktyp
 						},
 					})
 
-					if part.State != ToolInvocationStateOutputAvailable && part.State != ToolInvocationStateOutputError {
+					denied := isDeniedToolPart(part)
+					if part.State != ToolStateOutputAvailable && part.State != ToolStateOutputError && !denied {
 						continue
 					}
 
@@ -506,7 +507,14 @@ func MessagesToBedrock(messages []Message) ([]bedrocktypes.Message, []bedrocktyp
 					var resultParts []Part
 					status := bedrocktypes.ToolResultStatusSuccess
 
-					if part.State == ToolInvocationStateOutputError {
+					if denied {
+						// Mirrors the Vercel SDK: only the terminal output-denied
+						// state carries an error status, a fresh denial does not.
+						if part.State == ToolStateOutputDenied {
+							status = bedrocktypes.ToolResultStatusError
+						}
+						resultParts = []Part{{Type: PartTypeText, Text: deniedToolResultReason(part)}}
+					} else if part.State == ToolStateOutputError {
 						status = bedrocktypes.ToolResultStatusError
 						resultParts = []Part{{Type: PartTypeText, Text: part.ErrorText}}
 					} else {

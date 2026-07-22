@@ -110,14 +110,17 @@ func MessagesToOpenAI(messages []Message) ([]openai.ChatCompletionMessageParamUn
 						},
 					})
 
-					if part.State != ToolInvocationStateOutputAvailable && part.State != ToolInvocationStateOutputError {
+					denied := isDeniedToolPart(part)
+					if part.State != ToolStateOutputAvailable && part.State != ToolStateOutputError && !denied {
 						continue
 					}
 
 					parts := []openai.ChatCompletionContentPartTextParam{}
 
 					var resultParts []Part
-					if part.State == ToolInvocationStateOutputError {
+					if denied {
+						resultParts = []Part{{Type: PartTypeText, Text: deniedToolResultReason(part)}}
+					} else if part.State == ToolStateOutputError {
 						resultParts = []Part{{Type: PartTypeText, Text: part.ErrorText}}
 					} else {
 						var err error
