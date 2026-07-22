@@ -110,7 +110,8 @@ func MessagesToAnthropic(messages []Message) ([]anthropic.MessageParam, []anthro
 						},
 					})
 
-					if part.State != ToolInvocationStateOutputAvailable && part.State != ToolInvocationStateOutputError {
+					denied := isDeniedToolPart(part)
+					if part.State != ToolStateOutputAvailable && part.State != ToolStateOutputError && !denied {
 						continue
 					}
 
@@ -123,7 +124,11 @@ func MessagesToAnthropic(messages []Message) ([]anthropic.MessageParam, []anthro
 
 					resultContent := []anthropic.ToolResultBlockParamContentUnion{}
 
-					if part.State == ToolInvocationStateOutputError {
+					if denied {
+						resultContent = append(resultContent, anthropic.ToolResultBlockParamContentUnion{
+							OfText: &anthropic.TextBlockParam{Text: deniedToolResultReason(part)},
+						})
+					} else if part.State == ToolStateOutputError {
 						resultContent = append(resultContent, anthropic.ToolResultBlockParamContentUnion{
 							OfText: &anthropic.TextBlockParam{Text: part.ErrorText},
 						})
@@ -153,16 +158,21 @@ func MessagesToAnthropic(messages []Message) ([]anthropic.MessageParam, []anthro
 						}
 					}
 
+					toolResult := &anthropic.ToolResultBlockParam{
+						ToolUseID: part.ToolCallID,
+						Content:   resultContent,
+					}
+					// Mirrors the Vercel SDK: only the terminal output-denied
+					// state is flagged as an error, a fresh denial is not.
+					if part.State == ToolStateOutputDenied {
+						toolResult.IsError = anthropic.Bool(true)
+					}
+
 					// Send the tool result as a separate message with the role as user.
 					anthropicMessages = append(anthropicMessages, anthropic.MessageParam{
 						Role: anthropic.MessageParamRoleUser,
 						Content: []anthropic.ContentBlockParamUnion{
-							{
-								OfToolResult: &anthropic.ToolResultBlockParam{
-									ToolUseID: part.ToolCallID,
-									Content:   resultContent,
-								},
-							},
+							{OfToolResult: toolResult},
 						},
 					})
 				}
