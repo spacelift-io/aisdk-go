@@ -20,24 +20,45 @@ type Chat struct {
 // DataStream is a stream of DataStreamParts.
 type DataStream iter.Seq2[DataStreamPart, error]
 
-// StreamTransformer transforms stream parts as they flow through.
-// It can modify or replace parts before they reach the consumer.
-type StreamTransformer func(DataStreamPart) DataStreamPart
+// StreamTransformer transforms stream parts as they flow through. For each
+// part it returns the parts to emit in its place: one part to rewrite, several
+// to expand, an empty non-nil slice to drop, or nil to pass the original
+// through unchanged.
+type StreamTransformer func(DataStreamPart) []DataStreamPart
 
 // StreamProcessor observes stream parts as they flow through.
 // Processors cannot modify parts, only observe them.
 type StreamProcessor func(DataStreamPart)
 
-// WithTransformers wraps the DataStream to transform parts before they reach the consumer.
+// WithTransformers wraps the DataStream to transform parts before they reach
+// the consumer. Transformers apply left to right; parts produced by one
+// transformer flow through the remaining ones.
 func (s DataStream) WithTransformers(transformers ...StreamTransformer) DataStream {
 	return func(yield func(DataStreamPart, error) bool) {
 		s(func(part DataStreamPart, err error) bool {
-			if err == nil && part != nil {
-				for _, t := range transformers {
-					part = t(part)
+			if err != nil || part == nil {
+				return yield(part, err)
+			}
+
+			parts := []DataStreamPart{part}
+			for _, t := range transformers {
+				next := make([]DataStreamPart, 0, len(parts))
+				for _, p := range parts {
+					if out := t(p); out == nil {
+						next = append(next, p)
+					} else {
+						next = append(next, out...)
+					}
+				}
+				parts = next
+			}
+
+			for _, p := range parts {
+				if !yield(p, nil) {
+					return false
 				}
 			}
-			return yield(part, err)
+			return true
 		})
 	}
 }
@@ -60,12 +81,12 @@ func (s DataStream) WithProcessors(processors ...StreamProcessor) DataStream {
 // ReplyToMessageID returns a transformer that sets the message ID on MessageStartPart.
 // Use this when continuing/updating an existing message so useChat updates it in place.
 func ReplyToMessageID(messageID string) StreamTransformer {
-	return func(part DataStreamPart) DataStreamPart {
+	return func(part DataStreamPart) []DataStreamPart {
 		if p, ok := part.(MessageStartPart); ok {
 			p.MessageID = messageID
-			return p
+			return []DataStreamPart{p}
 		}
-		return part
+		return nil
 	}
 }
 
@@ -576,23 +597,23 @@ func InjectToolTitlesFromTools(tools []Tool) StreamTransformer {
 	}
 
 	if len(titlesByName) == 0 {
-		return func(part DataStreamPart) DataStreamPart { return part }
+		return func(DataStreamPart) []DataStreamPart { return nil }
 	}
 
-	return func(part DataStreamPart) DataStreamPart {
+	return func(part DataStreamPart) []DataStreamPart {
 		switch p := part.(type) {
 		case ToolInputStartPart:
 			if p.Title == "" {
 				p.Title = titlesByName[p.ToolName]
 			}
-			return p
+			return []DataStreamPart{p}
 		case ToolInputAvailablePart:
 			if p.Title == "" {
 				p.Title = titlesByName[p.ToolName]
 			}
-			return p
+			return []DataStreamPart{p}
 		default:
-			return part
+			return nil
 		}
 	}
 }
