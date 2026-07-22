@@ -225,14 +225,31 @@ func BedrockConverseToDataStream(stream bedrockruntime.ConverseStreamOutputReade
 					state := currentToolCalls[contentBlockID]
 					if state != nil {
 						var input map[string]any
+						var inputErr error
 						if state.Args != "" {
-							if err := json.Unmarshal([]byte(state.Args), &input); err != nil {
-								yield(nil, fmt.Errorf("unmarshalling tool input for call %s %q: %w", state.ID, state.Args, err))
-								return
-							}
+							inputErr = json.Unmarshal([]byte(state.Args), &input)
 						}
 
-						if !yield(ToolInputAvailablePart{
+						if inputErr != nil {
+							// Mirror Vercel: malformed tool input (typically max_tokens
+							// truncation) never errors the stream. Emit the error parts
+							// and keep going; the stop reason arrives in messageStop.
+							errorText := fmt.Sprintf("unmarshalling tool input for call %s: %s", state.ID, inputErr)
+							if !yield(ToolInputErrorPart{
+								ToolCallID: state.ID,
+								ToolName:   state.Name,
+								Input:      state.Args,
+								ErrorText:  errorText,
+							}, nil) {
+								return
+							}
+							if !yield(ToolOutputErrorPart{
+								ToolCallID: state.ID,
+								ErrorText:  errorText,
+							}, nil) {
+								return
+							}
+						} else if !yield(ToolInputAvailablePart{
 							ToolCallID: state.ID,
 							ToolName:   state.Name,
 							Input:      input,
