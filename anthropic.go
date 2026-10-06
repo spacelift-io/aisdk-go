@@ -74,20 +74,30 @@ func MessagesToAnthropic(messages []Message) ([]anthropic.MessageParam, []anthro
 			for _, part := range message.Parts {
 				switch part.Type {
 				case PartTypeReasoning:
-					if part.ProviderMetadata != nil && part.ProviderMetadata.Anthropic != nil && part.ProviderMetadata.Anthropic.RedactedData != "" {
-						content = append(content, anthropic.ContentBlockParamUnion{
-							OfRedactedThinking: &anthropic.RedactedThinkingBlockParam{
-								Data: part.ProviderMetadata.Anthropic.RedactedData,
-							},
-						})
+					// Mirrors the Vercel SDK: a thinking block is replayed only with
+					// Anthropic metadata, since the signature check on the Anthropic
+					// side fails for a signature from another provider.
+					if part.ProviderMetadata == nil || part.ProviderMetadata.Anthropic == nil {
 						continue
 					}
-					content = append(content, anthropic.ContentBlockParamUnion{
-						OfThinking: &anthropic.ThinkingBlockParam{
-							Thinking:  part.Text,
-							Signature: part.ProviderMetadata.Anthropic.Signature,
-						},
-					})
+
+					anthropicMetadata := part.ProviderMetadata.Anthropic
+					switch {
+					case anthropicMetadata.Signature != "":
+						content = append(content, anthropic.ContentBlockParamUnion{
+							OfThinking: &anthropic.ThinkingBlockParam{
+								Thinking:  reasoningText(part),
+								Signature: anthropicMetadata.Signature,
+							},
+						})
+
+					case anthropicMetadata.RedactedData != "":
+						content = append(content, anthropic.ContentBlockParamUnion{
+							OfRedactedThinking: &anthropic.RedactedThinkingBlockParam{
+								Data: anthropicMetadata.RedactedData,
+							},
+						})
+					}
 				case PartTypeText:
 					content = append(content, anthropic.ContentBlockParamUnion{
 						OfText: &anthropic.TextBlockParam{
