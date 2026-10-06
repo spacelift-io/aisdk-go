@@ -189,12 +189,8 @@ func MessagesToGoogle(messages []Message) ([]*genai.Content, *genai.Content, err
 					if part.ProviderMetadata == nil || part.ProviderMetadata.Google == nil || len(part.ProviderMetadata.Google.ThoughtSignature) == 0 {
 						continue
 					}
-					reasoningText := part.Reasoning
-					if reasoningText == "" {
-						reasoningText = part.Text
-					}
 					content.Parts = append(content.Parts, &genai.Part{
-						Text:             reasoningText,
+						Text:             reasoningText(part),
 						Thought:          true,
 						ThoughtSignature: part.ProviderMetadata.Google.ThoughtSignature,
 					})

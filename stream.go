@@ -655,6 +655,16 @@ func (p *Part) UnmarshalJSON(data []byte) error {
 		p.ProviderMetadata = temp.CallProviderMetadata
 	}
 
+	// The wire field for reasoning is text. The field the accumulator, the
+	// encoder and the provider converters use is Reasoning, so the decoded
+	// text goes there.
+	if justTheType.Type == string(PartTypeReasoning) {
+		if p.Reasoning == "" {
+			p.Reasoning = p.Text
+		}
+		p.Text = ""
+	}
+
 	return nil
 }
 
@@ -671,7 +681,7 @@ func (p Part) MarshalJSON() ([]byte, error) {
 		return json.Marshal(data)
 
 	case PartTypeReasoning:
-		data := map[string]any{"type": "reasoning", "text": p.Reasoning}
+		data := map[string]any{"type": "reasoning", "text": reasoningText(p)}
 		if p.State != "" {
 			data["state"] = string(p.State)
 		}
@@ -869,6 +879,15 @@ func toolResultToParts(result any) ([]Part, error) {
 		}
 		return []Part{{Type: PartTypeText, Text: string(jsonData)}}, nil
 	}
+}
+
+// reasoningText returns the reasoning of a part. Parts built by hand sometimes
+// have it in Text instead of Reasoning.
+func reasoningText(p Part) string {
+	if p.Reasoning != "" {
+		return p.Reasoning
+	}
+	return p.Text
 }
 
 // MessageCollector accumulates stream parts into a Message compatible with useChat round-trip.
@@ -1117,7 +1136,7 @@ func containsSimilarPart(parts []Part, p Part) bool {
 				return true
 			}
 		case PartTypeReasoning:
-			if existing.Reasoning == p.Reasoning {
+			if reasoningText(existing) == reasoningText(p) {
 				return true
 			}
 		}
