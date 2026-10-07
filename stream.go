@@ -608,6 +608,7 @@ type ProviderMetadata struct {
 	Anthropic *AnthropicProviderMetadata `json:"anthropic,omitzero"`
 	Google    *GoogleProviderMetadata    `json:"google,omitzero"`
 	Bedrock   *BedrockProviderMetadata   `json:"bedrock,omitzero"`
+	OpenAI    *OpenAIProviderMetadata    `json:"openai,omitzero"`
 }
 
 type AnthropicProviderMetadata struct {
@@ -624,8 +625,13 @@ type BedrockProviderMetadata struct {
 	RedactedData string `json:"redactedData,omitempty"` // Base64-encoded redacted reasoning payload
 }
 
+type OpenAIProviderMetadata struct {
+	ItemID                    string `json:"itemId,omitempty"`                    // Responses API reasoning item that a summary part belongs to
+	ReasoningEncryptedContent string `json:"reasoningEncryptedContent,omitempty"` // Encrypted reasoning replayed on the next turn, since nothing is stored on OpenAI's side
+}
+
 func hasProviderMetadata(metadata ProviderMetadata) bool {
-	return metadata.Anthropic != nil || metadata.Google != nil || metadata.Bedrock != nil
+	return metadata.Anthropic != nil || metadata.Google != nil || metadata.Bedrock != nil || metadata.OpenAI != nil
 }
 
 func (p *Part) UnmarshalJSON(data []byte) error {
