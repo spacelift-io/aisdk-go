@@ -7,6 +7,7 @@ import (
 	"io"
 	"iter"
 	"net/http"
+	"reflect"
 	"strings"
 )
 
@@ -1093,7 +1094,8 @@ func (c *MessageCollector) Message() Message {
 
 // MergeParts merges incoming parts with existing parts.
 // Tool invocation parts are merged by ToolCallID (updating existing ones).
-// Step-start parts are filtered out. Other parts are deduplicated by content.
+// Step-start parts are filtered out. Other parts are deduplicated by content,
+// and reasoning parts also by their provider metadata.
 func MergeParts(existing, incoming []Part) []Part {
 	result := make([]Part, 0, len(existing)+len(incoming))
 	toolPartIdx := make(map[string]int)
@@ -1142,9 +1144,17 @@ func containsSimilarPart(parts []Part, p Part) bool {
 				return true
 			}
 		case PartTypeReasoning:
-			if reasoningText(existing) == reasoningText(p) {
-				return true
+			if reasoningText(existing) != reasoningText(p) {
+				continue
 			}
+			// OpenAI reasoning without a summary has no text, so only its
+			// metadata tells one item from the next. A resent part without
+			// metadata still matches the stored one.
+			if existing.ProviderMetadata != nil && p.ProviderMetadata != nil &&
+				!reflect.DeepEqual(*existing.ProviderMetadata, *p.ProviderMetadata) {
+				continue
+			}
+			return true
 		}
 	}
 	return false
