@@ -448,11 +448,6 @@ func MessagesToBedrock(messages []Message) ([]bedrocktypes.Message, []bedrocktyp
 					})
 
 				case PartTypeReasoning:
-					reasoningText := part.Reasoning
-					if reasoningText == "" {
-						reasoningText = part.Text
-					}
-
 					if part.ProviderMetadata == nil || part.ProviderMetadata.Bedrock == nil {
 						continue
 					}
@@ -464,7 +459,7 @@ func MessagesToBedrock(messages []Message) ([]bedrocktypes.Message, []bedrocktyp
 						assistantContent = append(assistantContent, &bedrocktypes.ContentBlockMemberReasoningContent{
 							Value: &bedrocktypes.ReasoningContentBlockMemberReasoningText{
 								Value: bedrocktypes.ReasoningTextBlock{
-									Text:      strPtr(reasoningText),
+									Text:      strPtr(reasoningText(part)),
 									Signature: &signature,
 								},
 							},
