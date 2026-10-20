@@ -255,6 +255,7 @@ func AnthropicToDataStream(stream *ssestream.Stream[anthropic.MessageStreamEvent
 	dataStream := func(yield func(DataStreamPart, error) bool) {
 		var lastChunk *anthropic.MessageStreamEventUnion
 		finalReason := FinishReasonUnknown
+		var finalMetadata ProviderMetadata
 		// var finalUsage Usage
 		var currentToolCall struct {
 			ID   string
@@ -439,6 +440,15 @@ func AnthropicToDataStream(stream *ssestream.Stream[anthropic.MessageStreamEvent
 				if event.Delta.StopReason != "" {
 					finalReason = mapAnthropicStopReason(event.Delta.StopReason)
 				}
+				if event.Delta.JSON.StopDetails.Valid() {
+					finalMetadata.Anthropic = &AnthropicProviderMetadata{
+						StopDetails: &AnthropicStopDetails{
+							Type:        string(event.Delta.StopDetails.Type),
+							Category:    string(event.Delta.StopDetails.Category),
+							Explanation: event.Delta.StopDetails.Explanation,
+						},
+					}
+				}
 
 			case anthropic.MessageStopEvent:
 				// Fall back to "stop" when the provider never reported a stop reason.
@@ -452,7 +462,10 @@ func AnthropicToDataStream(stream *ssestream.Stream[anthropic.MessageStreamEvent
 				}
 
 				// Send final finish message
-				if !yield(FinishPart{FinishReason: finalReason}, nil) {
+				if !yield(FinishPart{
+					FinishReason:     finalReason,
+					ProviderMetadata: finalMetadata,
+				}, nil) {
 					return
 				}
 			}
@@ -476,7 +489,7 @@ func AnthropicToDataStream(stream *ssestream.Stream[anthropic.MessageStreamEvent
 
 			// "unknown" is not part of the client's finish-reason enum, so omit
 			// the field entirely when the provider never reported a reason.
-			finishPart := FinishPart{}
+			finishPart := FinishPart{ProviderMetadata: finalMetadata}
 			if finalReason != FinishReasonUnknown {
 				finishPart.FinishReason = finalReason
 			}
