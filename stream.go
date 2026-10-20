@@ -498,6 +498,8 @@ func (p FinishStepPart) Type() string { return "finish-step" }
 // FinishPart indicates the completion of a message.
 type FinishPart struct {
 	FinishReason FinishReason `json:"finishReason,omitzero"`
+	// The UI finish chunk has no providerMetadata field, so this is not serialized.
+	ProviderMetadata ProviderMetadata `json:"-"`
 }
 
 func (p FinishPart) Type() string { return "finish" }
@@ -613,8 +615,15 @@ type ProviderMetadata struct {
 }
 
 type AnthropicProviderMetadata struct {
-	Signature    string `json:"signature,omitempty"`    // Optional signature for reasoning
-	RedactedData string `json:"redactedData,omitempty"` // Encrypted payload of a redacted_thinking block, replayed verbatim
+	Signature    string                `json:"signature,omitempty"`    // Optional signature for reasoning
+	RedactedData string                `json:"redactedData,omitempty"` // Encrypted payload of a redacted_thinking block, replayed verbatim
+	StopDetails  *AnthropicStopDetails `json:"stopDetails,omitempty"`
+}
+
+type AnthropicStopDetails struct {
+	Type        string `json:"type"`
+	Category    string `json:"category,omitempty"` // Empty when the model refused on its own and no classifier triggered
+	Explanation string `json:"explanation,omitempty"`
 }
 
 type GoogleProviderMetadata struct {
