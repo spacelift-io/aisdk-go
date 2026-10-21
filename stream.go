@@ -536,6 +536,7 @@ type Message struct {
 	Parts       []Part           `json:"parts,omitempty"`
 	Annotations []any            `json:"annotations,omitempty"`
 	Attachments []Attachment     `json:"experimental_attachments,omitempty"`
+	Metadata    json.RawMessage  `json:"metadata,omitempty"`
 }
 
 type PartType string
